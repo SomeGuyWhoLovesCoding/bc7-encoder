@@ -1,4 +1,4 @@
-### BC7 Encoder
+## BC7 Encoder
 
 This version actually knows what it's doing and optimizes for any real world texture with minimal compilation setup.
 
@@ -73,3 +73,39 @@ And as a final conclusion...
 **This is the only bc7 compression tool that's both ultra-optimized and as a command-line tool, baked into my passion project "Funkin' View".**
 
 The end. Now, please try it out. Your mind will be BLOWN.
+
+## Benchmark (sorta)
+
+The numbers speak for themselves:
+
+```
+F:\_\NewDownloads\official-bc7-encoder\v3>myprogram dad.png dad.dds
+Loaded dad.png: 3950x1680 (4 ch)
+Encoder path: Scalar
+Encoded 414960 blocks in 127.9 ms (3245074 blocks/sec, 6 threads, Scalar)
+Original: 26544000 bytes, BC7: 6639360 bytes (4.00:1, 25.0%)
+Wrote dad.dds
+
+F:\_\NewDownloads\official-bc7-encoder\v3>myprogram dad.png dad.dds
+Loaded dad.png: 3950x1680 (4 ch)
+Encoder path: Scalar
+Encoded 414960 blocks in 133.3 ms (3113060 blocks/sec, 6 threads, Scalar)
+Original: 26544000 bytes, BC7: 6639360 bytes (4.00:1, 25.0%)
+Wrote dad.dds
+
+F:\_\NewDownloads\official-bc7-encoder\v3>myprogram dad.png dad.dds
+Loaded dad.png: 3950x1680 (4 ch)
+Encoder path: Scalar
+Encoded 414960 blocks in 121.0 ms (3430068 blocks/sec, 6 threads, Scalar)
+Original: 26544000 bytes, BC7: 6639360 bytes (4.00:1, 25.0%)
+Wrote dad.dds
+
+F:\_\NewDownloads\official-bc7-encoder\v3>myprogram dad.png dad.dds
+Loaded dad.png: 3950x1680 (4 ch)
+Encoder path: Scalar
+Encoded 414960 blocks in 131.1 ms (3166116 blocks/sec, 6 threads, Scalar)
+Original: 26544000 bytes, BC7: 6639360 bytes (4.00:1, 25.0%)
+Wrote dad.dds
+```
+
+It doesn't matter if it's power of two, because this is entirely CPU-based and multithreaded.
