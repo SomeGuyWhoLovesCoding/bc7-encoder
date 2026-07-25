@@ -12,15 +12,13 @@ However, in doing this, I encountered a few issues trying to find the most effic
 
 ...has a basic bc7/bptc encoder that's SLOW as hell. Doesn't help that it uses the GPU because too bad I'm on an IGPU which is a SHARED spot in the CPU, just with automatic SIMD running in there.
 
-I don't give a shit about microsoft's products, even if I still don't mind windows 10 being end of support last year as of this repository's creation, so I'm not relying on that for real-time bc7 compression.
+I don't give a damn bout microsoft products, even if I still don't mind windows 10 being end of support last year as of this repository's creation, but this doesn't mean I'll be relying on that for real-time bc7 compression.
 
 It utilizes no compute-saving optimizations, if at all, because it's stuck being an academic version made by a giant corp.
 
-It's also wasting the GPU's lifespan, so why not just try to compile and then fuck it up for hours on end to be without that in the process?
+It's also wasting the GPU's lifespan, so why not just try to compile it and fix the issue?
 
-...
-
-Exactly.
+...Exactly.
 
 2. Richgell's BC7E/F_RDO
 
@@ -30,13 +28,17 @@ Fuck it, the ISPC version of bc7 compression was thankfully discontinued, and in
 
 When going to basis universal (which I actually found about very early on in my bc7 compression rabbithole), I saw it as a bulky ass compressed texture transcoder, which does not fit my purpose at all.
 
-It does have bc7f in it, whichh
+It does have bc7f in it, whichh... Eh, not really gonna bother.
+
+bc7f/rdo (as far as I know) is to build yourself whilst it's average efficiency proper bc7 compression code, just with ISPC instead to apparently "speed" up the process.
 
 3. AMD's compressinator
 
-I fucking hate how it performs. Compressinator uses the GPU as well, but it also feels like it's stuck as an ACADEMIC (literally) version, just like texconv.
+I fucking hate how BC7 encoding performs on THIS specific tool. Compressinator is very bulky, meaning it's not easily just a lightweight cross-platform drop in feature, and even that's stuck as an ACADEMIC version (literally), just like texconv.
 
-It does have GPU options, but I'm also not willing to handle all gpu options, as they're technically useless anyway. It's like it's built for NVIDIA. Fuck compressinator, and I will always say fuck it.
+It does have GPU options, but I'm also not willing to handle all gpu options, as they're technically useless to me anyway. It's like it's built for NVIDIA. Fuck compressinator, in my honest opinion, and I will always say fuck it.
+
+You can like compressinator all you want, but I still think it has some bulk speed. I initially struggled to be nice here, because I tried the tool myself specifically with png to BC7.
 
 4. My tool
 
@@ -108,4 +110,10 @@ Original: 26544000 bytes, BC7: 6639360 bytes (4.00:1, 25.0%)
 Wrote dad.dds
 ```
 
-It doesn't matter if it's power of two, because this is entirely CPU-based and multithreaded.
+Compared to texconv, if the same size, would be SO much slower, like I'm talking a rough ~7.9x slowdown on the exact spritesheet and its size, just to get as good of an output quality as with this tool.
+
+and compared to amd's compressonator, which in fact is even worse than texconv, and I'm also forced to multiple by 4 texture if I try to do GPU mode, but I'll say it's like around 14 times due to how slow it compresses even a texture that's only ~500x500, which in fact I assume is for balanced quality.
+
+*I even had to time it myself with stopwatch on windows' Clock app due to the fact there's no said precise time being printed in the end.*
+
+It also doesn't matter if it's power of two, because this is entirely CPU-based and multithreaded.
