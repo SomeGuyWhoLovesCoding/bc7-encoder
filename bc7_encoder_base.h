@@ -41,7 +41,7 @@ static inline T ispc_select(bool cond, T a, T b) { return cond ? a : b; }
 #define BC7E_BLOCK_SIZE (16)
 #define BC7E_MAX_PARTITIONS0 (16)
 #define BC7E_MAX_PARTITIONS1 (64)
-#define BC7E_MAX_PARTITIONS2 (16)
+#define BC7E_MAX_PARTITIONS2 (8)
 #define BC7E_MAX_PARTITIONS3 (64)
 #define BC7E_MAX_PARTITIONS7 (64)
 #define BC7E_MAX_UBER_LEVEL (4)
@@ -442,58 +442,18 @@ static void compute_block_stats(bc7_block_stats * pStats, const color_quad_i * p
 // Instead of running color_cell_compression_est on all 64 partitions,
 // sort pixels by luma, try splitting at the 8 most likely boundaries.
 // Returns the best partition index.
-// Luma-based fast partition estimator for 2-subset modes (1, 3).
-// UPDATED: Now finds the dominant RGB channel (highest range) to sort by,
-// preventing luma-collisions from breaking apart different colored pixels.
-// Returns the best partition index.
 static uint32_t quick_estimate_partition_2subset(const color_quad_i * pPixels, const bc7_block_stats * pStats, const bc7e_compress_block_params * pComp_params)
 {
-        // 1. Find the dominant RGB channel (the one with the largest min/max range)
-        int min_r = 255, max_r = 0;
-        int min_g = 255, max_g = 0;
-        int min_b = 255, max_b = 0;
-
-        for (int i = 0; i < 16; i++)
-        {
-                int r = pPixels[i].m_c[0];
-                int g = pPixels[i].m_c[1];
-                int b = pPixels[i].m_c[2];
-
-                if (r < min_r) min_r = r; if (r > max_r) max_r = r;
-                if (g < min_g) min_g = g; if (g > max_g) max_g = g;
-                if (b < min_b) min_b = b; if (b > max_b) max_b = b;
-        }
-
-        int range_r = max_r - min_r;
-        int range_g = max_g - min_g;
-        int range_b = max_b - min_b;
-
-        // 2. Populate sort keys based on the dominant channel
-        int sort_keys[16];
-        if (range_r >= range_g && range_r >= range_b)
-        {
-                for (int i = 0; i < 16; i++) sort_keys[i] = pPixels[i].m_c[0];
-        }
-        else if (range_g >= range_b) 
-        {
-                for (int i = 0; i < 16; i++) sort_keys[i] = pPixels[i].m_c[1];
-        }
-        else
-        {
-                for (int i = 0; i < 16; i++) sort_keys[i] = pPixels[i].m_c[2];
-        }
-
-        // 3. Sort pixel indices by the dominant channel keys
+        // Sort pixel indices by luma
         int order[16];
         for (int i = 0; i < 16; i++) order[i] = i;
-        
         // Simple insertion sort (16 elements)
         for (int i = 1; i < 16; i++)
         {
                 int key = order[i];
-                int kv = sort_keys[key];
+                int kv = pStats->luma[key];
                 int j = i - 1;
-                while (j >= 0 && sort_keys[order[j]] > kv)
+                while (j >= 0 && pStats->luma[order[j]] > kv)
                 {
                         order[j + 1] = order[j];
                         j--;
@@ -501,9 +461,7 @@ static uint32_t quick_estimate_partition_2subset(const color_quad_i * pPixels, c
                 order[j + 1] = key;
         }
 
-        // --- EVERYTHING BELOW THIS LINE IS YOUR EXACT ORIGINAL CODE ---
-
-        // Try splitting the dominant-channel-sorted list into two groups at various boundaries.
+        // Try splitting the luma-sorted list into two groups at various boundaries.
         // For each split, compute the intra-cluster variance (lower = better partition).
         // Then find the BC7 partition that best matches that 2-way split.
         //
