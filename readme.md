@@ -1,6 +1,8 @@
 ## BC7 Encoder
 
-This version actually knows what it's doing and optimizes for any real world texture with minimal compilation setup.
+This version actually knows what it's doing and optimizes for any real world texture with minimal compilation setup. It is completely beginner friendly and that's it
+
+---
 
 *So here's my story:*
 
@@ -10,21 +12,19 @@ However, in doing this, I encountered a few issues trying to find the most effic
 
 1. DirectXTex (made by Microsoft of all people)
 
-...has a basic bc7/bptc encoder that's SLOW as hell. Doesn't help that it uses the GPU because too bad I'm on an IGPU which is a SHARED spot in the CPU, just with automatic SIMD running in there.
+...has a basic bc7/bptc encoder that apparently uses an academic variant of compressing bc7, which has been baked into other texture formats, even USING the GPU, but doesn't mean I'll be relying on texconv for real-time bc7 compression either.
 
-I don't give a damn bout microsoft products, even if I still don't mind windows 10 being end of support last year as of this repository's creation, but this doesn't mean I'll be relying on that for real-time bc7 compression.
+It utilizes no optimizations, if at all, because of the fact it's even stuck being an academic version made by a giant corp.
 
-It utilizes no compute-saving optimizations, if at all, because it's stuck being an academic version made by a giant corp.
-
-It's also wasting the GPU's lifespan, so why not just try to compile it and fix the issue?
+It's also a waste of the GPU's resource, but I was thinking for bit "why not just try to compile it and fix the issue?"
 
 ...Exactly.
 
 2. Richgell's BC7E/F_RDO
 
-You've never heard of this person, because he's had this strange and super-niche hobby of a specific texture compression known as bc7, where he tries to experiment with optimizing it, such as RDO for example (**Rate Distortion Optimization**), and even programming the whole ass encoder in ispc, which adds a few MORE layers of compelxity.
+You've never heard of this person, because he's had this strange but super-niche hobby of a specific texture compression known as bc7, where he tries to experiment with optimizing it, such as RDO for example (**Rate Distortion Optimization**), and even programming the whole ass encoder in ispc, which added a few MORE layers of compelxity.
 
-Fuck it, the ISPC version of bc7 compression was thankfully discontinued, and intel themselves have ceased all future updates of it.
+Fuck it, the ISPC version of bc7 compression was discontinued and so you , and intel themselves have ceased all future updates of it.
 
 When going to basis universal (which I actually found about very early on in my bc7 compression rabbithole), I saw it as a bulky ass compressed texture transcoder, which does not fit my purpose at all.
 
@@ -36,9 +36,11 @@ bc7f/rdo (as far as I know) is to build yourself whilst it's average efficiency 
 
 3. AMD's compressinator
 
-I fucking hate how BC7 encoding performs on THIS specific tool. Compressinator is very bulky, meaning it's not easily just a lightweight cross-platform drop in feature, and even that's stuck as an ACADEMIC version (literally), just like texconv.
+The fact BC7 encoding performs this bad on a specific tool like is insane. Compressinator is very bulky, meaning it's not easily just a lightweight cross-platform drop in feature, and even that's stuck as an ACADEMIC version (literally), just like texconv.
 
-It does have GPU options, but I'm also not willing to handle all gpu options, as they're technically useless to me anyway. It's like it's built for NVIDIA. Fuck compressinator, in my honest opinion, and I will always say fuck it.
+It does have GPU options, but I'm also not willing to handle all gpu options, as they're technically useless to me anyway.
+
+Fuck it, i'll even go as far as saying it's built for NVIDIA.
 
 You can like compressinator all you want, but I still think it has some bulk speed. I initially struggled to be nice here, because I tried the tool myself specifically with png to BC7.
 
