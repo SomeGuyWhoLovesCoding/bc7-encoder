@@ -28,6 +28,8 @@ Fuck it, the ISPC version of bc7 compression was thankfully discontinued, and in
 
 When going to basis universal (which I actually found about very early on in my bc7 compression rabbithole), I saw it as a bulky ass compressed texture transcoder, which does not fit my purpose at all.
 
+*This tool's based on their ispc code though!*
+
 It does have bc7f in it, whichh... Eh, not really gonna bother.
 
 bc7f/rdo (as far as I know) is to build yourself whilst it's average efficiency proper bc7 compression code, just with ISPC instead to apparently "speed" up the process.
