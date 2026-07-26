@@ -28,6 +28,7 @@
 // tail latency from variable block compression times.
 
 #include "bc7_encoder_base.h"
+//#include "bc7_metrics.h"
 
 // NOTE: bc7_encoder_simd.h, bc7_encoder_dispatch.h, and
 // bc7_encoder_simd_impl.inc are intentionally NOT included.
@@ -36,6 +37,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 #include <thread>
 #include <chrono>
@@ -135,7 +137,7 @@ public:
         return "Scalar (Atomic Work Stealing)";
     }
 
-    void encode_image_mt(const uint8_t* rgba, int w, int h, std::vector<uint8_t>& bc7_out) {
+    void encode_image_mt(const uint8_t* rgba, int w, int h, bool perceptual, std::vector<uint8_t>& bc7_out) {
         const int BW = 4, BH = 4;
         int bx_count = (w + BW - 1) / BW;
         int by_count = (h + BH - 1) / BH;
@@ -161,9 +163,16 @@ public:
             }
         }
 
+        perceptualMode = perceptual;
+
         // Quality 2 (default/balanced)
         bc7e_compress_block_params params;
-        bc7e_compress_block_params_init(&params, false);
+        bc7e_compress_block_params_init(&params, perceptual);
+
+        // Override AFTER init — don't touch the init function itself
+        params.m_opaque_settings.m_use_mode[3] = false;
+        //params.m_opaque_settings.m_use_mode[2] = false;
+        //printf("UBER LEVEL: %d\n", params.m_uber_level);
 
         // bc7e_compress_block_init() initializes the codec's lookup tables
         // (defined in bc7_encoder_base.h, independent of any SIMD path).
@@ -233,20 +242,81 @@ private:
     // Hard-point the function pointer at the scalar implementation from base.h.
     // No CPUID detection, no SIMD fallback ladder, no per-thread dispatch cache.
     static const compress_fn g_encode_fn;
+    bool perceptualMode;
 };
 
 // Initialize the static function pointer
 const BC7Encoder::compress_fn BC7Encoder::g_encode_fn = bc7e_compress_block_range;
 
+static void generate_mode_visualization(const char* filename, const uint8_t* bc7_data, int width, int height) {
+    int bw = (width + 3) / 4;
+    int bh = (height + 3) / 4;
+    
+    // Colors for each mode (RGB)
+    uint8_t mode_colors[8][3] = {
+        {0, 255, 255},   // Mode 0: Cyan
+        {255, 0, 0},     // Mode 1: Red
+        {0, 255, 0},     // Mode 2: Green
+        {255, 255, 0},   // Mode 3: Yellow
+        {255, 0, 255},   // Mode 4: Magenta
+        {255, 128, 0},   // Mode 5: Orange
+        {0, 0, 255},     // Mode 6: Blue
+        {255, 255, 255}  // Mode 7: White
+    };
+
+    std::vector<uint8_t> vis(width * height * 3, 0);
+
+    for (int by = 0; by < bh; by++) {
+        for (int bx = 0; bx < bw; bx++) {
+            int block_idx = by * bw + bx;
+            uint8_t first_byte = bc7_data[block_idx * 16];
+            
+            // Extract mode from the first byte (lowest set bit)
+            uint32_t mode = 0;
+            while (mode < 8 && !(first_byte & (1 << mode))) mode++;
+            if (mode >= 8) mode = 7; // fallback
+
+            uint8_t r = mode_colors[mode][0];
+            uint8_t g = mode_colors[mode][1];
+            uint8_t b = mode_colors[mode][2];
+
+            for (int py = 0; py < 4; py++) {
+                for (int px = 0; px < 4; px++) {
+                    int x = bx * 4 + px;
+                    int y = by * 4 + py;
+                    if (x < width && y < height) {
+                        int di = (y * width + x) * 3;
+                        vis[di + 0] = r;
+                        vis[di + 1] = g;
+                        vis[di + 2] = b;
+                    }
+                }
+            }
+        }
+    }
+
+    // Write as PPM (P6) - universally supported, no extra libraries needed
+    FILE* f = fopen(filename, "wb");
+    if (f) {
+        fprintf(f, "P6\n%d %d\n255\n", width, height);
+        fwrite(vis.data(), 1, vis.size(), f);
+        fclose(f);
+        fprintf(stderr, "Wrote mode visualization to %s\n", filename);
+    } else {
+        fprintf(stderr, "Error: Could not write mode visualization to %s\n", filename);
+    }
+}
+
 int main(int argc, char* argv[])
 {
     if (argc < 3) {
-        fprintf(stderr, "Usage: %s <input.png> <output.dds>\n", argv[0]);
+        fprintf(stderr, "Usage: %s <input.png> <output.dds> <perceptualmode 1 or 0>\n", argv[0]);
         return 1;
     }
 
     const char* in_path = argv[1];
     const char* out_path = argv[2];
+    const bool percep_mode = argv[3] != nullptr;
 
     int w = 0, h = 0, ch = 0;
     uint8_t* pixels = stbi_load(in_path, &w, &h, &ch, 4);
@@ -255,11 +325,11 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    fprintf(stderr, "Loaded %s: %dx%d (%d ch)\n", in_path, w, h, ch);
+    fprintf(stderr, "Loaded %dx%d image \"%s\" (%d ch) - PERCEPTUAL MODE: %s\n", w, h, in_path, ch, percep_mode ? "ON" : "OFF");
 
     BC7Encoder encoder;
     std::vector<uint8_t> bc7;
-    encoder.encode_image_mt(pixels, w, h, bc7);
+    encoder.encode_image_mt(pixels, w, h, percep_mode, bc7);
 
     size_t orig = (size_t)w * h * 4;
     fprintf(stderr, "Original: %zu bytes, BC7: %zu bytes (%.2f:1, %.1f%%)\n",
@@ -270,8 +340,22 @@ int main(int argc, char* argv[])
         stbi_image_free(pixels);
         return 1;
     }
-
     fprintf(stderr, "Wrote %s\n", out_path);
+
+    // ── Mode Visualization ──
+    // Generates a PPM image where each 4x4 block is colored by its chosen BC7 mode.
+    std::string mode_vis_path = out_path;
+    size_t dot_pos = mode_vis_path.find_last_of('.');
+    if (dot_pos != std::string::npos) {
+        mode_vis_path = mode_vis_path.substr(0, dot_pos) + "_modes.ppm";
+    } else {
+        mode_vis_path += "_modes.ppm";
+    }
+    generate_mode_visualization(mode_vis_path.c_str(), bc7.data(), w, h);
+
+    // ── Quality Metrics (matches bc7enc output format) ──
+    // compute_and_print_all_metrics(pixels, bc7.data(), bc7.size(), w, h);
+
     stbi_image_free(pixels);
     return 0;
 }
