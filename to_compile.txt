@@ -1,0 +1,2 @@
+Open x64 Native Tools Command Prompt for VS 2022 as Administrator and run this:
+cl.exe /Fe"F:\jerem\NewDownloads\official-bc7-encoder\bc7-encoder\bc7.exe" "F:\jerem\NewDownloads\official-bc7-encoder\bc7-encoder\bc7_encoder_example.cpp" -O2 /std:c++14

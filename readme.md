@@ -1,6 +1,12 @@
 ## BC7 Encoder
 
-This version actually knows what it's doing and optimizes for any real world texture with minimal compilation setup. It is completely beginner friendly and that's it
+This version actually knows what it's doing and optimizes for any real world texture with minimal compilation setup. It is completely beginner friendly and that's it.
+
+Now for PSNR comparison...
+
+![Oop! One pixel difference.](barchart.png)
+
+Yep. Mine's virtually identical, and also (possibly) better quality than others, except it's multitudes faster because I just observed the exact speed of each of the encoders on the list and have done vastly big amounts of other plentiful optimizations, including but not limited to mode stealing (which does ).
 
 ---
 
@@ -72,13 +78,15 @@ Also note there's no quality option because this is already at its max possible 
 
 *And no SIMD was even used in this (not even std::fma), as with what I said earlier. This library already compiles with autovectorization no matter what.*
 
-I don't give a fuck if you credit me or not, because this tool would start showing up more often as it lives due to having great potential of being both beginner-friendly and optimized for extreme speed.
+I don't give a fuck if you credit me or not, because this tool would start showing up more often as it lives, due to having great potential of being both beginner-friendly and optimized for extreme speed.
 
 And as a final conclusion...
 
 **This is the only bc7 compression tool that's both ultra-optimized and as a command-line tool, baked into my passion project "Funkin' View".**
 
 The end. Now, please try it out. Your mind will be BLOWN.
+
+*Wait, I forgot something. Not only is it fast on its own, but thanks to recently implementing a concurrency technique known as "atomic work stealing" (kudos to qwen3.7-plus), encoding to bc7 can now be as fast as humanly possible on like L1 cache, which is ridiculous, so in theory, this is the fastest possible software bc7 compression tool indefinitely.*
 
 ## Benchmark (sorta)
 
@@ -116,7 +124,7 @@ Wrote dad.dds
 
 Compared to texconv, if the same size, would be SO much slower, like I'm talking a rough ~7.9x slowdown on the exact spritesheet and its size, just to get as good of an output quality as with this tool.
 
-and compared to amd's compressonator, which in fact is even worse than texconv, and I'm also forced to multiple by 4 texture if I try to do GPU mode, but I'll say it's like around 14 times due to how slow it compresses even a texture that's only ~500x500, which in fact I assume is for balanced quality.
+and compared to amd's compressonator, which in fact is even worse than texconv, and I'm also forced to multiple by 4 texture if I try to do GPU mode, but I'll say it's like around 18-20 times due to how slow it compresses even a texture that's only ~500x500, which in fact I have known the default is basically max quality.
 
 *I even had to time it myself with stopwatch on windows' Clock app due to the fact there's no said precise time being printed in the end.*
 
@@ -137,5 +145,3 @@ PNG reference
 **Now, for a highlight, here:**
 
 <img width="1320" height="1653" alt="image" src="https://github.com/user-attachments/assets/0d477e72-8a6c-48e8-bd2d-5e6d5e38de55" />
-
-PNSR soon...

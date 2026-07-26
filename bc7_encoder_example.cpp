@@ -1,4 +1,4 @@
-// bc7_encoder_example.cpp - Multithreaded scalar BC7 encoder
+// bc7_encoder_example.cpp - Multithreaded scalar BC7 encoder with atomic work stealing
 //
 // IMPORTANT: This must be compiled as a single translation unit because
 // bc7_encoder_base.h defines non-inline functions and globals (g_codec_initialized).
@@ -23,8 +23,9 @@
 //   bc7_encoder_example input.png output.dds
 //
 // Quality is locked to level 2 (default/balanced).
-// Uses all available CPU cores via std::thread.
-// Scalar encoder only - no SIMD dispatch.
+// Uses all available CPU cores via std::thread with atomic work stealing 
+// (chunked dynamic scheduling) to ensure optimal load balancing and prevent 
+// tail latency from variable block compression times.
 
 #include "bc7_encoder_base.h"
 
@@ -39,6 +40,7 @@
 #include <thread>
 #include <chrono>
 #include <algorithm>
+#include <atomic>
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -120,109 +122,121 @@ static bool write_dds_bc7(const char* filename, int width, int height,
     return true;
 }
 
-// Function pointer type matching bc7e_compress_block_range's signature.
-// Using a typedef so the same threading code can call the scalar function
-// uniformly. We do NOT use the dispatch wrapper - we call the scalar
-// implementation directly.
-typedef void (*bc7e_compress_block_range_fn)(uint32_t first_block, uint32_t count,
-    uint64_t* pBlocks, const uint32_t* pPixelsRGBA,
-    const bc7e_compress_block_params* pComp_params);
+class BC7Encoder {
+public:
+    // Function pointer type matching bc7e_compress_block_range's signature.
+    using compress_fn = void (*)(uint32_t first_block, uint32_t count,
+                                 uint64_t* pBlocks, const uint32_t* pPixelsRGBA,
+                                 const bc7e_compress_block_params* pComp_params);
 
-// Hard-point the function pointer at the scalar implementation from base.h.
-// No CPUID detection, no SIMD fallback ladder, no per-thread dispatch cache.
-static const bc7e_compress_block_range_fn g_encode_fn = bc7e_compress_block_range;
+    BC7Encoder() = default;
 
-static const char* bc7e_get_encoder_path_string() {
-    return "Scalar";
-}
-
-static void encode_image_bc7_mt(const uint8_t* rgba, int w, int h,
-                                 std::vector<uint8_t>& bc7_out)
-{
-    const int BW = 4, BH = 4;
-    int bx_count = (w + BW - 1) / BW;
-    int by_count = (h + BH - 1) / BH;
-    uint32_t total_blocks = (uint32_t)(bx_count * by_count);
-
-    // Prepare input pixels: pad to multiple of 4x4, pack as uint32_t RGBA
-    int pw = bx_count * BW;
-    int ph = by_count * BH;
-    std::vector<uint32_t> pixels_rgba(total_blocks * 16, 0);
-
-    for (int y = 0; y < ph; y++) {
-        int sy = (y < h) ? y : (h - 1);
-        for (int x = 0; x < pw; x++) {
-            int sx = (x < w) ? x : (w - 1);
-            int si = (sy * w + sx) * 4;
-            uint32_t pixel = (uint32_t)rgba[si + 0]
-                          | ((uint32_t)rgba[si + 1] << 8)
-                          | ((uint32_t)rgba[si + 2] << 16)
-                          | ((uint32_t)rgba[si + 3] << 24);
-            int block_idx = (y / BH) * bx_count + (x / BW);
-            int pixel_in_block = (y % BH) * BW + (x % BW);
-            pixels_rgba[block_idx * 16 + pixel_in_block] = pixel;
-        }
+    static const char* get_encoder_path_string() {
+        return "Scalar (Atomic Work Stealing)";
     }
 
-    // Quality 2 (default/balanced)
-    bc7e_compress_block_params params;
-    bc7e_compress_block_params_init(&params, false);
+    void encode_image_mt(const uint8_t* rgba, int w, int h, std::vector<uint8_t>& bc7_out) {
+        const int BW = 4, BH = 4;
+        int bx_count = (w + BW - 1) / BW;
+        int by_count = (h + BH - 1) / BH;
+        uint32_t total_blocks = (uint32_t)(bx_count * by_count);
 
-    // bc7e_compress_block_init() initializes the codec's lookup tables
-    // (defined in bc7_encoder_base.h, independent of any SIMD path).
-    bc7e_compress_block_init();
+        // Prepare input pixels: pad to multiple of 4x4, pack as uint32_t RGBA
+        int pw = bx_count * BW;
+        int ph = by_count * BH;
+        std::vector<uint32_t> pixels_rgba(total_blocks * 16, 0);
 
-    // Print encoder path info
-    fprintf(stderr, "Encoder path: %s\n", bc7e_get_encoder_path_string());
-
-    // Determine thread count: use hardware concurrency, capped at block count
-    unsigned num_threads = std::min(
-        std::max(1u, std::thread::hardware_concurrency()),
-        (unsigned)total_blocks);
-
-    std::vector<uint64_t> blocks(total_blocks * 2);
-
-    // ---- TIMED ENCODE ----
-    auto t0 = std::chrono::high_resolution_clock::now();
-
-    if (num_threads <= 1) {
-        // Single-threaded scalar encode
-        g_encode_fn(0, total_blocks, blocks.data(),
-                    pixels_rgba.data(), &params);
-    } else {
-        // Multi-threaded scalar encode: each thread compresses a disjoint
-        // block range directly via bc7e_compress_block_range (no dispatch).
-        std::vector<std::thread> threads(num_threads);
-        uint32_t blocks_per_thread = total_blocks / num_threads;
-        uint32_t remainder = total_blocks % num_threads;
-        uint32_t offset = 0;
-
-        for (unsigned t = 0; t < num_threads; t++) {
-            uint32_t count = blocks_per_thread + (t < remainder ? 1 : 0);
-            threads[t] = std::thread(
-                g_encode_fn,
-                offset, count,
-                blocks.data(),
-                pixels_rgba.data(),
-                &params);
-            offset += count;
+        for (int y = 0; y < ph; y++) {
+            int sy = (y < h) ? y : (h - 1);
+            for (int x = 0; x < pw; x++) {
+                int sx = (x < w) ? x : (w - 1);
+                int si = (sy * w + sx) * 4;
+                uint32_t pixel = (uint32_t)rgba[si + 0]
+                              | ((uint32_t)rgba[si + 1] << 8)
+                              | ((uint32_t)rgba[si + 2] << 16)
+                              | ((uint32_t)rgba[si + 3] << 24);
+                int block_idx = (y / BH) * bx_count + (x / BW);
+                int pixel_in_block = (y % BH) * BW + (x % BW);
+                pixels_rgba[block_idx * 16 + pixel_in_block] = pixel;
+            }
         }
 
-        for (auto& th : threads)
-            th.join();
+        // Quality 2 (default/balanced)
+        bc7e_compress_block_params params;
+        bc7e_compress_block_params_init(&params, false);
+
+        // bc7e_compress_block_init() initializes the codec's lookup tables
+        // (defined in bc7_encoder_base.h, independent of any SIMD path).
+        bc7e_compress_block_init();
+
+        // Determine thread count: use hardware concurrency, capped at block count
+        unsigned num_threads = std::min(
+            std::max(1u, std::thread::hardware_concurrency()),
+            (unsigned)total_blocks);
+
+        std::vector<uint64_t> blocks(total_blocks * 2);
+
+        // ---- TIMED ENCODE ----
+        auto t0 = std::chrono::high_resolution_clock::now();
+
+        if (num_threads <= 1) {
+            // Single-threaded scalar encode
+            g_encode_fn(0, total_blocks, blocks.data(), pixels_rgba.data(), &params);
+        } else {
+            // Multi-threaded scalar encode with atomic work stealing (chunked dynamic scheduling).
+            // Instead of statically partitioning blocks, threads atomically fetch chunks of work.
+            // This prevents tail latency caused by variable block compression times.
+            std::atomic<uint32_t> next_block{0};
+            
+            // Chunk size balances atomic contention overhead vs load balancing granularity.
+            // 64 blocks per chunk is a robust default for BC7 scalar encoding. 
+            // Tune this value (e.g., 32, 64, 128) based on your specific CPU and image characteristics.
+            constexpr uint32_t chunk_size = 64;
+
+            auto worker = [&]() {
+                while (true) {
+                    // Atomically claim a chunk of blocks
+                    uint32_t start = next_block.fetch_add(chunk_size, std::memory_order_relaxed);
+                    if (start >= total_blocks) {
+                        break; // No more work to steal
+                    }
+                    
+                    uint32_t count = std::min(chunk_size, total_blocks - start);
+                    g_encode_fn(start, count, blocks.data(), pixels_rgba.data(), &params);
+                }
+            };
+
+            std::vector<std::thread> threads;
+            threads.reserve(num_threads);
+            for (unsigned t = 0; t < num_threads; ++t) {
+                threads.emplace_back(worker);
+            }
+
+            for (auto& th : threads) {
+                th.join();
+            }
+        }
+
+        auto t1 = std::chrono::high_resolution_clock::now();
+        double encode_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+        fprintf(stderr, "Encoded %u blocks in %.1f ms (%.0f blocks/sec, %u threads, %s)\n",
+                total_blocks, encode_ms,
+                encode_ms > 0 ? (total_blocks / (encode_ms / 1000.0)) : 0.0,
+                num_threads, get_encoder_path_string());
+
+        bc7_out.resize(total_blocks * 16);
+        memcpy(bc7_out.data(), blocks.data(), total_blocks * 16);
     }
 
-    auto t1 = std::chrono::high_resolution_clock::now();
-    double encode_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+private:
+    // Hard-point the function pointer at the scalar implementation from base.h.
+    // No CPUID detection, no SIMD fallback ladder, no per-thread dispatch cache.
+    static const compress_fn g_encode_fn;
+};
 
-    fprintf(stderr, "Encoded %u blocks in %.1f ms (%.0f blocks/sec, %u threads, %s)\n",
-            total_blocks, encode_ms,
-            encode_ms > 0 ? (total_blocks / (encode_ms / 1000.0)) : 0.0,
-            num_threads, bc7e_get_encoder_path_string());
-
-    bc7_out.resize(total_blocks * 16);
-    memcpy(bc7_out.data(), blocks.data(), total_blocks * 16);
-}
+// Initialize the static function pointer
+const BC7Encoder::compress_fn BC7Encoder::g_encode_fn = bc7e_compress_block_range;
 
 int main(int argc, char* argv[])
 {
@@ -243,8 +257,9 @@ int main(int argc, char* argv[])
 
     fprintf(stderr, "Loaded %s: %dx%d (%d ch)\n", in_path, w, h, ch);
 
+    BC7Encoder encoder;
     std::vector<uint8_t> bc7;
-    encode_image_bc7_mt(pixels, w, h, bc7);
+    encoder.encode_image_mt(pixels, w, h, bc7);
 
     size_t orig = (size_t)w * h * 4;
     fprintf(stderr, "Original: %zu bytes, BC7: %zu bytes (%.2f:1, %.1f%%)\n",
