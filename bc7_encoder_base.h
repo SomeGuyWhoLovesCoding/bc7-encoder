@@ -42,7 +42,7 @@ static inline T ispc_select(bool cond, T a, T b) { return cond ? a : b; }
 #define BC7E_MAX_PARTITIONS0 (8)
 #define BC7E_MAX_PARTITIONS1 (16) // set from 32 to 16
 #define BC7E_MAX_PARTITIONS2 (16) // keep this at 16 minimum
-#define BC7E_MAX_PARTITIONS3 (64) // was 32 but i dont think mode 3 uhhhhhhh
+#define BC7E_MAX_PARTITIONS3 (16) // was 32 but i dont think mode 3 uhhhhhhh
 #define BC7E_MAX_PARTITIONS7 (64)
 #define BC7E_MAX_UBER_LEVEL (4)
 
@@ -874,167 +874,145 @@ void bc7e_compress_block_init()
 
 		} // c
 
-	// Disable the uninitialized Mode 6 LUT fast path by maxing out the errors.
-	// This forces the encoder to always fall back to the robust least-squares
-	// endpoint search, which correctly handles degenerate blocks.
-	for (int c = 0; c < 256; c++)
-	{
-		g_bc7_mode6_lut[c][0][0].err_r = UINT32_MAX;
-		g_bc7_mode6_lut[c][0][1].err_r = UINT32_MAX;
-		g_bc7_mode6_lut[c][1][0].err_r = UINT32_MAX;
-		g_bc7_mode6_lut[c][1][1].err_r = UINT32_MAX;
-	}
-
-	g_codec_initialized = true;
+		g_codec_initialized = true;
 }
 
 static void compute_least_squares_endpoints_rgba(uint32_t N, const  int * pSelectors, const  vec4F * pSelector_weights,  vec4F * pXl,  vec4F * pXh, const  color_quad_i *  pColors)
 {
-    float z00 = 0.0f, z01 = 0.0f, z10 = 0.0f, z11 = 0.0f;
-    float q00_r = 0.0f, q10_r = 0.0f, t_r = 0.0f;
-    float q00_g = 0.0f, q10_g = 0.0f, t_g = 0.0f;
-    float q00_b = 0.0f, q10_b = 0.0f, t_b = 0.0f;
-    float q00_a = 0.0f, q10_a = 0.0f, t_a = 0.0f;
-    for ( uint32_t i = 0; i < N; i++)
-    {
-        const uint32_t sel = pSelectors[i];
-        z00 += pSelector_weights[sel].m_c[0];
-        z10 += pSelector_weights[sel].m_c[1];
-        z11 += pSelector_weights[sel].m_c[2];
-        float w = pSelector_weights[sel].m_c[3];
-        q00_r += w * (int)pColors[i].m_c[0]; t_r += (int)pColors[i].m_c[0];
-        q00_g += w * (int)pColors[i].m_c[1]; t_g += (int)pColors[i].m_c[1];
-        q00_b += w * (int)pColors[i].m_c[2]; t_b += (int)pColors[i].m_c[2];
-        q00_a += w * (int)pColors[i].m_c[3]; t_a += (int)pColors[i].m_c[3];
-    }
-
-    q10_r = t_r - q00_r; q10_g = t_g - q00_g; q10_b = t_b - q00_b; q10_a = t_a - q00_a;
-    z01 = z10;
-
-    float det = z00 * z11 - z01 * z10;
-    if (det != 0.0f) det = 1.0f / det; // fixes darkening artifact from just setting it to 1.0f
-
-    float iz00 = z11 * det, iz01 = -z01 * det, iz10 = -z10 * det, iz11 = z00 * det;
-
-    pXl->m_c[0] = (float)(iz00 * q00_r + iz01 * q10_r); pXh->m_c[0] = (float)(iz10 * q00_r + iz11 * q10_r);
-    pXl->m_c[1] = (float)(iz00 * q00_g + iz01 * q10_g); pXh->m_c[1] = (float)(iz10 * q00_g + iz11 * q10_g);
-    pXl->m_c[2] = (float)(iz00 * q00_b + iz01 * q10_b); pXh->m_c[2] = (float)(iz10 * q00_b + iz11 * q10_b);
-    pXl->m_c[3] = (float)(iz00 * q00_a + iz01 * q10_a); pXh->m_c[3] = (float)(iz10 * q00_a + iz11 * q10_a);
-
-	for (uint32_t c = 0; c < 4; c++)
-	{
-		if ((pXl->m_c[c] < 0.0f) || (pXh->m_c[c] > 255.0f))
+		// Least squares using normal equations: http://www.cs.cornell.edu/~bindel/class/cs3220-s12/notes/lec10.pdf 
+		// I did this in matrix form first, expanded out all the ops, then optimized it a bit.
+		float z00 = 0.0f, z01 = 0.0f, z10 = 0.0f, z11 = 0.0f;
+		float q00_r = 0.0f, q10_r = 0.0f, t_r = 0.0f;
+		float q00_g = 0.0f, q10_g = 0.0f, t_g = 0.0f;
+		float q00_b = 0.0f, q10_b = 0.0f, t_b = 0.0f;
+		float q00_a = 0.0f, q10_a = 0.0f, t_a = 0.0f;
+		for ( uint32_t i = 0; i < N; i++)
 		{
-			uint32_t lo_v = UINT32_MAX, hi_v = 0;
-			for (uint32_t i = 0; i < N; i++)
-			{
-				lo_v = minimumu(lo_v, (uint32_t)pColors[i].m_c[c]);
-				hi_v = maximumu(hi_v, (uint32_t)pColors[i].m_c[c]);
-			}
+				const uint32_t sel = pSelectors[i];
 
-			if (lo_v == hi_v)                // ← ONLY when all pixels identical
-			{
-				pXl->m_c[c] = (float)lo_v;
-				pXh->m_c[c] = (float)hi_v;
-			}
-			// Otherwise: leave out-of-bounds values alone.
-			// find_optimal_solution's vec4F_saturate_in_place will clamp them
-			// while preserving the extrapolation direction.
+// #pragma ignore warning(perf)  [ISPC pragma, no-op in C++]
+				z00 += pSelector_weights[sel].m_c[0];
+// #pragma ignore warning(perf)  [ISPC pragma, no-op in C++]
+				z10 += pSelector_weights[sel].m_c[1];
+// #pragma ignore warning(perf)  [ISPC pragma, no-op in C++]
+				z11 += pSelector_weights[sel].m_c[2];
+
+// #pragma ignore warning(perf)  [ISPC pragma, no-op in C++]
+				float w = pSelector_weights[sel].m_c[3];
+
+				q00_r += w * (int)pColors[i].m_c[0]; t_r += (int)pColors[i].m_c[0];
+				q00_g += w * (int)pColors[i].m_c[1]; t_g += (int)pColors[i].m_c[1];
+				q00_b += w * (int)pColors[i].m_c[2]; t_b += (int)pColors[i].m_c[2];
+				q00_a += w * (int)pColors[i].m_c[3]; t_a += (int)pColors[i].m_c[3];
 		}
-	}
+
+		q10_r = t_r - q00_r;
+		q10_g = t_g - q00_g;
+		q10_b = t_b - q00_b;
+		q10_a = t_a - q00_a;
+
+		z01 = z10;
+
+		float det = z00 * z11 - z01 * z10;
+		if (det != 0.0f)
+				det = 1.0f / det;
+
+		float iz00, iz01, iz10, iz11;
+		iz00 = z11 * det;
+		iz01 = -z01 * det;
+		iz10 = -z10 * det;
+		iz11 = z00 * det;
+
+		pXl->m_c[0] = (float)(iz00 * q00_r + iz01 * q10_r); pXh->m_c[0] = (float)(iz10 * q00_r + iz11 * q10_r);
+		pXl->m_c[1] = (float)(iz00 * q00_g + iz01 * q10_g); pXh->m_c[1] = (float)(iz10 * q00_g + iz11 * q10_g);
+		pXl->m_c[2] = (float)(iz00 * q00_b + iz01 * q10_b); pXh->m_c[2] = (float)(iz10 * q00_b + iz11 * q10_b);
+		pXl->m_c[3] = (float)(iz00 * q00_a + iz01 * q10_a); pXh->m_c[3] = (float)(iz10 * q00_a + iz11 * q10_a);
 }
 
 static void compute_least_squares_endpoints_rgb(uint32_t N, const  int * pSelectors, const  vec4F * pSelector_weights,  vec4F * pXl,  vec4F * pXh, const  color_quad_i * pColors)
 {
-    float z00 = 0.0f, z01 = 0.0f, z10 = 0.0f, z11 = 0.0f;
-    float q00_r = 0.0f, q10_r = 0.0f, t_r = 0.0f;
-    float q00_g = 0.0f, q10_g = 0.0f, t_g = 0.0f;
-    float q00_b = 0.0f, q10_b = 0.0f, t_b = 0.0f;
-    for ( uint32_t i = 0; i < N; i++)
-    {
-        const uint32_t sel = pSelectors[i];
-        z00 += pSelector_weights[sel].m_c[0];
-        z10 += pSelector_weights[sel].m_c[1];
-        z11 += pSelector_weights[sel].m_c[2];
-        float w = pSelector_weights[sel].m_c[3];
-        q00_r += w * (int)pColors[i].m_c[0]; t_r += (int)pColors[i].m_c[0];
-        q00_g += w * (int)pColors[i].m_c[1]; t_g += (int)pColors[i].m_c[1];
-        q00_b += w * (int)pColors[i].m_c[2]; t_b += (int)pColors[i].m_c[2];
-    }
-
-    q10_r = t_r - q00_r; q10_g = t_g - q00_g; q10_b = t_b - q00_b;
-    z01 = z10;
-
-    float det = z00 * z11 - z01 * z10;
-    if (det != 0.0f) det = 1.0f / det; // fixes darkening artifact from just setting it to 1.0f
-
-    float iz00 = z11 * det, iz01 = -z01 * det, iz10 = -z10 * det, iz11 = z00 * det;
-
-    pXl->m_c[0] = (float)(iz00 * q00_r + iz01 * q10_r); pXh->m_c[0] = (float)(iz10 * q00_r + iz11 * q10_r);
-    pXl->m_c[1] = (float)(iz00 * q00_g + iz01 * q10_g); pXh->m_c[1] = (float)(iz10 * q00_g + iz11 * q10_g);
-    pXl->m_c[2] = (float)(iz00 * q00_b + iz01 * q10_b); pXh->m_c[2] = (float)(iz10 * q00_b + iz11 * q10_b);
-    pXl->m_c[3] = 255.0f; pXh->m_c[3] = 255.0f;
-
-	for (uint32_t c = 0; c < 3; c++)
-	{
-		if ((pXl->m_c[c] < 0.0f) || (pXh->m_c[c] > 255.0f))
+		// Least squares using normal equations: http://www.cs.cornell.edu/~bindel/class/cs3220-s12/notes/lec10.pdf 
+		// I did this in matrix form first, expanded out all the ops, then optimized it a bit.
+		float z00 = 0.0f, z01 = 0.0f, z10 = 0.0f, z11 = 0.0f;
+		float q00_r = 0.0f, q10_r = 0.0f, t_r = 0.0f;
+		float q00_g = 0.0f, q10_g = 0.0f, t_g = 0.0f;
+		float q00_b = 0.0f, q10_b = 0.0f, t_b = 0.0f;
+		for ( uint32_t i = 0; i < N; i++)
 		{
-			uint32_t lo_v = UINT32_MAX, hi_v = 0;
-			for (uint32_t i = 0; i < N; i++)
-			{
-				lo_v = minimumu(lo_v, (uint32_t)pColors[i].m_c[c]);
-				hi_v = maximumu(hi_v, (uint32_t)pColors[i].m_c[c]);
-			}
+				const uint32_t sel = pSelectors[i];
 
-			if (lo_v == hi_v)
-			{
-				pXl->m_c[c] = (float)lo_v;
-				pXh->m_c[c] = (float)hi_v;
-			}
+// #pragma ignore warning(perf)  [ISPC pragma, no-op in C++]
+				z00 += pSelector_weights[sel].m_c[0];
+// #pragma ignore warning(perf)  [ISPC pragma, no-op in C++]
+				z10 += pSelector_weights[sel].m_c[1];
+// #pragma ignore warning(perf)  [ISPC pragma, no-op in C++]
+				z11 += pSelector_weights[sel].m_c[2];
+// #pragma ignore warning(perf)  [ISPC pragma, no-op in C++]
+				float w = pSelector_weights[sel].m_c[3];
+
+				q00_r += w * (int)pColors[i].m_c[0]; t_r += (int)pColors[i].m_c[0];
+				q00_g += w * (int)pColors[i].m_c[1]; t_g += (int)pColors[i].m_c[1];
+				q00_b += w * (int)pColors[i].m_c[2]; t_b += (int)pColors[i].m_c[2];
 		}
-	}
+
+		q10_r = t_r - q00_r;
+		q10_g = t_g - q00_g;
+		q10_b = t_b - q00_b;
+
+		z01 = z10;
+
+		float det = z00 * z11 - z01 * z10;
+		if (det != 0.0f)
+				det = 1.0f / det;
+
+		float iz00, iz01, iz10, iz11;
+		iz00 = z11 * det;
+		iz01 = -z01 * det;
+		iz10 = -z10 * det;
+		iz11 = z00 * det;
+
+		pXl->m_c[0] = (float)(iz00 * q00_r + iz01 * q10_r); pXh->m_c[0] = (float)(iz10 * q00_r + iz11 * q10_r);
+		pXl->m_c[1] = (float)(iz00 * q00_g + iz01 * q10_g); pXh->m_c[1] = (float)(iz10 * q00_g + iz11 * q10_g);
+		pXl->m_c[2] = (float)(iz00 * q00_b + iz01 * q10_b); pXh->m_c[2] = (float)(iz10 * q00_b + iz11 * q10_b);
 }
 
 static void compute_least_squares_endpoints_a(uint32_t N, const  int * pSelectors, const vec4F * pSelector_weights,  float * pXl,  float * pXh, const  color_quad_i * pColors)
 {
-    float z00 = 0.0f, z01 = 0.0f, z10 = 0.0f, z11 = 0.0f;
-    float q00_a = 0.0f, q10_a = 0.0f, t_a = 0.0f;
-    for ( uint32_t i = 0; i < N; i++)
-    {
-        const uint32_t sel = pSelectors[i];
-        z00 += pSelector_weights[sel].m_c[0];
-        z10 += pSelector_weights[sel].m_c[1];
-        z11 += pSelector_weights[sel].m_c[2];
-        float w = pSelector_weights[sel].m_c[3];
-        q00_a += w * (int)pColors[i].m_c[3]; t_a += (int)pColors[i].m_c[3];
-    }
-
-    q10_a = t_a - q00_a;
-    z01 = z10;
-
-    float det = z00 * z11 - z01 * z10;
-    if (det != 0.0f) det = 1.0f / det; // fixes darkening artifact from just setting it to 1.0f
-
-    float iz00 = z11 * det, iz01 = -z01 * det, iz10 = -z10 * det, iz11 = z00 * det;
-
-    *pXl = (float)(iz00 * q00_a + iz01 * q10_a); 
-    *pXh = (float)(iz10 * q00_a + iz11 * q10_a);
-
-	if ((*pXl < 0.0f) || (*pXh > 255.0f))
-	{
-		uint32_t lo_v = UINT32_MAX, hi_v = 0;
-		for (uint32_t i = 0; i < N; i++)
+		// Least squares using normal equations: http://www.cs.cornell.edu/~bindel/class/cs3220-s12/notes/lec10.pdf 
+		// I did this in matrix form first, expanded out all the ops, then optimized it a bit.
+		float z00 = 0.0f, z01 = 0.0f, z10 = 0.0f, z11 = 0.0f;
+		float q00_a = 0.0f, q10_a = 0.0f, t_a = 0.0f;
+		for ( uint32_t i = 0; i < N; i++)
 		{
-			lo_v = minimumu(lo_v, (uint32_t)pColors[i].m_c[3]);
-			hi_v = maximumu(hi_v, (uint32_t)pColors[i].m_c[3]);
+				const uint32_t sel = pSelectors[i];
+
+// #pragma ignore warning(perf)  [ISPC pragma, no-op in C++]
+				z00 += pSelector_weights[sel].m_c[0];
+// #pragma ignore warning(perf)  [ISPC pragma, no-op in C++]
+				z10 += pSelector_weights[sel].m_c[1];
+// #pragma ignore warning(perf)  [ISPC pragma, no-op in C++]
+				z11 += pSelector_weights[sel].m_c[2];
+// #pragma ignore warning(perf)  [ISPC pragma, no-op in C++]
+				float w = pSelector_weights[sel].m_c[3];
+
+				q00_a += w * (int)pColors[i].m_c[3]; t_a += (int)pColors[i].m_c[3];
 		}
 
-		if (lo_v == hi_v)
-		{
-			*pXl = (float)lo_v;
-			*pXh = (float)hi_v;
-		}
-	}
+		q10_a = t_a - q00_a;
+
+		z01 = z10;
+
+		float det = z00 * z11 - z01 * z10;
+		if (det != 0.0f)
+				det = 1.0f / det;
+
+		float iz00, iz01, iz10, iz11;
+		iz00 = z11 * det;
+		iz01 = -z01 * det;
+		iz10 = -z10 * det;
+		iz11 = z00 * det;
+
+		*pXl = (float)(iz00 * q00_a + iz01 * q10_a); *pXh = (float)(iz10 * q00_a + iz11 * q10_a);
 }
 
 struct color_cell_compressor_params
@@ -1097,62 +1075,76 @@ static inline color_quad_i scale_color(const  color_quad_i * pC, const  color_ce
 
 static const float pr_weight = (.5f / (1.0f - .2126f)) * (.5f / (1.0f - .2126f));
 static const float pb_weight = (.5f / (1.0f - .0722f)) * (.5f / (1.0f - .0722f));
-static inline uint64_t compute_color_distance_rgb(const color_quad_i * pE1, const color_quad_i * pE2, bool perceptual, const uint32_t weights[4])
+
+static inline uint64_t compute_color_distance_rgb(const  color_quad_i *  pE1, const  color_quad_i * pE2,  bool perceptual, const uint32_t  weights[4])
 {
-    if (perceptual)
-    {
-        // Integer BT.709 Luma/Cb/Cr distance (matches bc7enc.c exactly)
-        const int l1 = pE1->m_c[0] * 109 + pE1->m_c[1] * 366 + pE1->m_c[2] * 37;
-        const int cr1 = ((int)pE1->m_c[0] << 9) - l1;
-        const int cb1 = ((int)pE1->m_c[2] << 9) - l1;
+		if (perceptual)
+		{
+				const float l1 = pE1->m_c[0] * .2126f + pE1->m_c[1] * .7152f + pE1->m_c[2] * .0722f;
+				const float cr1 = pE1->m_c[0] - l1;
+				const float cb1 = pE1->m_c[2] - l1;
 
-        const int l2 = pE2->m_c[0] * 109 + pE2->m_c[1] * 366 + pE2->m_c[2] * 37;
-        const int cr2 = ((int)pE2->m_c[0] << 9) - l2;
-        const int cb2 = ((int)pE2->m_c[2] << 9) - l2;
+				const float l2 = pE2->m_c[0] * .2126f + pE2->m_c[1] * .7152f + pE2->m_c[2] * .0722f;
+				const float cr2 = pE2->m_c[0] - l2;
+				const float cb2 = pE2->m_c[2] - l2;
 
-        const int dr = (l1 - l2) >> 8;
-        const int dg = (cr1 - cr2) >> 8;
-        const int db = (cb1 - cb2) >> 8;
+				float dl = l1 - l2;
+				float dcr = cr1 - cr2;
+				float dcb = cb1 - cb2;
 
-        return (int64_t)(weights[0] * (dr * dr) + weights[1] * (dg * dg) + weights[2] * (db * db));
-    }
-    else
-    {
-        float dr = (float)pE1->m_c[0] - (float)pE2->m_c[0];
-        float dg = (float)pE1->m_c[1] - (float)pE2->m_c[1];
-        float db = (float)pE1->m_c[2] - (float)pE2->m_c[2];
-        return (int64_t)(weights[0] * dr * dr + weights[1] * dg * dg + weights[2] * db * db);
-    }
+				return (int64_t)(weights[0] * (dl * dl) + weights[1] * pr_weight * (dcr * dcr) + weights[2] * pb_weight * (dcb * dcb));
+		}
+		else
+		{
+				float dr = (float)pE1->m_c[0] - (float)pE2->m_c[0];
+				float dg = (float)pE1->m_c[1] - (float)pE2->m_c[1];
+				float db = (float)pE1->m_c[2] - (float)pE2->m_c[2];
+				
+				return (int64_t)(weights[0] * dr * dr + weights[1] * dg * dg + weights[2] * db * db);
+		}
 }
 
 static inline uint64_t compute_color_distance_rgba(const color_quad_i * pE1, const color_quad_i * pE2, bool perceptual, const uint32_t weights[4])
 {
-    int da = (int)pE1->m_c[3] - (int)pE2->m_c[3];
-    uint64_t a_err = weights[3] * (da * da);
+    float da = (float)pE1->m_c[3] - (float)pE2->m_c[3];
+    float a_err = weights[3] * (da * da);
+
+    float rgb_err = 0.0f;
 
     if (perceptual)
     {
-        const int l1 = pE1->m_c[0] * 109 + pE1->m_c[1] * 366 + pE1->m_c[2] * 37;
-        const int cr1 = ((int)pE1->m_c[0] << 9) - l1;
-        const int cb1 = ((int)pE1->m_c[2] << 9) - l1;
+        const float l1 = pE1->m_c[0] * .2126f + pE1->m_c[1] * .7152f + pE1->m_c[2] * .0722f;
+        const float cr1 = pE1->m_c[0] - l1;
+        const float cb1 = pE1->m_c[2] - l1;
 
-        const int l2 = pE2->m_c[0] * 109 + pE2->m_c[1] * 366 + pE2->m_c[2] * 37;
-        const int cr2 = ((int)pE2->m_c[0] << 9) - l2;
-        const int cb2 = ((int)pE2->m_c[2] << 9) - l2;
+        const float l2 = pE2->m_c[0] * .2126f + pE2->m_c[1] * .7152f + pE2->m_c[2] * .0722f;
+        const float cr2 = pE2->m_c[0] - l2;
+        const float cb2 = pE2->m_c[2] - l2;
 
-        const int dr = (l1 - l2) >> 8;
-        const int dg = (cr1 - cr2) >> 8;
-        const int db = (cb1 - cb2) >> 8;
+        float dl = l1 - l2;
+        float dcr = cr1 - cr2;
+        float dcb = cb1 - cb2;
 
-        return a_err + (int64_t)(weights[0] * (dr * dr) + weights[1] * (dg * dg) + weights[2] * db * db);
+        rgb_err = weights[0] * (dl * dl) + weights[1] * pr_weight * (dcr * dcr) + weights[2] * pb_weight * (dcb * dcb);
     }
     else
     {
         float dr = (float)pE1->m_c[0] - (float)pE2->m_c[0];
         float dg = (float)pE1->m_c[1] - (float)pE2->m_c[1];
         float db = (float)pE1->m_c[2] - (float)pE2->m_c[2];
-        return a_err + (int64_t)(weights[0] * dr * dr + weights[1] * dg * dg + weights[2] * db * db);
+        
+        rgb_err = weights[0] * dr * dr + weights[1] * dg * dg + weights[2] * db * db;
     }
+
+    // === NEW PSNR BOOST FOR SPRITESHEETS ===
+    // Multiply the RGB error by the pixel's actual visibility (alpha / 255).
+    // If a pixel is fully transparent (alpha 0), RGB error becomes 0. 
+    // The encoder will stop wasting bits on invisible pixels.
+    float visibility = (float)pE1->m_c[3] * (1.0f / 255.0f);
+    rgb_err *= visibility;
+    // =========================================
+
+    return (int64_t)(rgb_err + a_err);
 }
 
 static uint64_t pack_mode1_to_one_color(const  color_cell_compressor_params * pParams,  color_cell_compressor_results * pResults, uint32_t r, uint32_t g, uint32_t b, 
@@ -1650,47 +1642,54 @@ static uint64_t evaluate_solution(const color_quad_i *pLow, const color_quad_i *
 	return total_err;
 }
 
-static void fixDegenerateEndpoints(uint32_t mode, color_quad_i *pTrialMinColor, color_quad_i *pTrialMaxColor, const vec4F *pXl, const vec4F *pXh, uint32_t iscale)
+static void fixDegenerateEndpoints( uint32_t mode,  color_quad_i * pTrialMinColor,  color_quad_i * pTrialMaxColor, const  vec4F * pXl, const  vec4F * pXh,  uint32_t iscale)
 {
-        // Fix degenerate endpoints for ALL modes — not just 1 and 4.
-        // 3-subset modes (0, 2) are especially prone to endpoint collapse
-        // due to low precision and few pixels per subset.
-        const uint32_t num_comps = (mode >= 4 && mode <= 7) ? 4 : 3;
+		if ((mode == 1) || (mode == 4)) // also mode 2
+		{
+				// fix degenerate case where the input collapses to a single colorspace voxel, and we loose all freedom (test with grayscale ramps)
+				for ( uint32_t i = 0; i < 3; i++)
+				{
+						if (pTrialMinColor->m_c[i] == pTrialMaxColor->m_c[i])
+						{
+								if (abs(pXl->m_c[i] - pXh->m_c[i]) > 0.0f)
+								{
+										if (pTrialMinColor->m_c[i] > (iscale >> 1))
+										{
+												if (pTrialMinColor->m_c[i] > 0)
+														pTrialMinColor->m_c[i]--;
+												else
+														if (pTrialMaxColor->m_c[i] < iscale)
+																pTrialMaxColor->m_c[i]++;
+										}
+										else
+										{
+												if (pTrialMaxColor->m_c[i] < iscale)
+														pTrialMaxColor->m_c[i]++;
+												else if (pTrialMinColor->m_c[i] > 0)
+														pTrialMinColor->m_c[i]--;
+										}
 
-        for (uint32_t i = 0; i < num_comps; i++)
-        {
-                if (pTrialMinColor->m_c[i] == pTrialMaxColor->m_c[i])
-                {
-                        if (fabs(pXl->m_c[i] - pXh->m_c[i]) > 0.0f)
-                        {
-                                // Endpoints collapsed after quantization, but floats differ.
-                                // Push apart in the direction suggested by the float values.
-                                if (pTrialMinColor->m_c[i] > (iscale >> 1))
-                                {
-                                        if (pTrialMinColor->m_c[i] > 0)
-                                                pTrialMinColor->m_c[i]--;
-                                        else if (pTrialMaxColor->m_c[i] < iscale)
-                                                pTrialMaxColor->m_c[i]++;
-                                }
-                                else
-                                {
-                                        if (pTrialMaxColor->m_c[i] < iscale)
-                                                pTrialMaxColor->m_c[i]++;
-                                        else if (pTrialMinColor->m_c[i] > 0)
-                                                pTrialMinColor->m_c[i]--;
-                                }
-                        }
-                        else
-                        {
-                                // Fully degenerate: floats also identical (det==0 case).
-                                // Must force endpoints apart or subset becomes solid black.
-                                if (pTrialMaxColor->m_c[i] < iscale)
-                                        pTrialMaxColor->m_c[i]++;
-                                else if (pTrialMinColor->m_c[i] > 0)
-                                        pTrialMinColor->m_c[i]--;
-                        }
-                }
-        }
+										if (mode == 4)
+										{
+												if (pTrialMinColor->m_c[i] > (iscale >> 1))
+												{
+														if (pTrialMaxColor->m_c[i] < iscale)
+																pTrialMaxColor->m_c[i]++;
+														else if (pTrialMinColor->m_c[i] > 0)
+																pTrialMinColor->m_c[i]--;
+												}
+												else
+												{
+														if (pTrialMinColor->m_c[i] > 0)
+																pTrialMinColor->m_c[i]--;
+														else if (pTrialMaxColor->m_c[i] < iscale)
+																pTrialMaxColor->m_c[i]++;
+												}
+										}
+								}
+						}
+				}
+		}
 }
 
 static uint64_t find_optimal_solution( uint32_t mode,  vec4F * pXl,  vec4F * pXh, const  color_cell_compressor_params * pParams,  color_cell_compressor_results * pResults, 
@@ -2167,15 +2166,14 @@ static uint64_t color_cell_compression( uint32_t mode, const  color_cell_compres
 				}
 		}
 
-        if (vec4F_dot(&axis, &axis) < .5f)
-        {
-                // Use BT.709 weights for the fallback axis. 
-                // This guarantees that even if RGB channels are identical, 
-                // the alpha/luma weighting prevents minColor == maxColor from collapsing,
-                // which causes solid black artifacts on spritesheets when perceptual=false.
-                vec4F_set(&axis, .213f, .715f, .072f, pParams->m_has_alpha ? .715f : 0);
-                vec4F_normalize_in_place(&axis);
-        }
+		if (vec4F_dot(&axis, &axis) < .5f)
+		{
+				if (pParams->m_perceptual)
+						vec4F_set(&axis, .213f, .715f, .072f, pParams->m_has_alpha ? .715f : 0);
+				else
+						vec4F_set(&axis, 1.0f, 1.0f, 1.0f, pParams->m_has_alpha ? 1.0f : 0);
+				vec4F_normalize_in_place(&axis);
+		}
 
 		float l = 1e+9f, h = -1e+9f;
 
@@ -3740,106 +3738,40 @@ static void handle_alpha_block(void * pBlock, const  color_quad_i * pPixels, con
 		// (clustered at 0 and 255), the alpha dimension dominates PCA variance,
 		// starving RGB of representation and causing color channel collapse
 		// (e.g. G and B decoding to identical values).
-		if (pComp_params->m_alpha_settings.m_use_mode6)
-        {
-                color_cell_compressor_params params6 = *pParams;
+		if (pComp_params->m_alpha_settings.m_use_mode6 && !bimodal_alpha)
+		{
+				 color_cell_compressor_params params6 = *pParams;
 
-                // Apply mode67 error weight multipliers for NORMAL alpha blocks
-                if (!bimodal_alpha)
-                {
-                        params6.m_weights[0] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[0];
-                        params6.m_weights[1] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[1];
-                        params6.m_weights[2] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[2];
-                        params6.m_weights[3] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[3];
-                }
-                else
-                {
-                        // BIMODAL ALPHA FIX: Suppress alpha's PCA influence.
-                        // Alpha variance (0 vs 255) dominates PCA, starving RGB and collapsing endpoints.
-                        // Set alpha weight near-zero so PCA focuses on RGB.
-                        // Mode 6 uses same indices for RGBA, so good RGB selectors also give
-                        // reasonable alpha interpolation between (0,0,0,0) and (R,G,B,255).
-                        params6.m_weights[0] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[0];
-                        params6.m_weights[1] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[1];
-                        params6.m_weights[2] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[2];
-                        params6.m_weights[3] = 1;  // ← KEY CHANGE: near-zero alpha weight
-                }
+				params6.m_weights[0] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[0];
+				params6.m_weights[1] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[1];
+				params6.m_weights[2] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[2];
+				params6.m_weights[3] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[3];
 
-                params6.m_pSelector_weights = g_bc7_weights4;
-                params6.m_pSelector_weightsx = (const vec4F *)&g_bc7_weights4x[0];
-                params6.m_num_selector_weights = 16;
+				color_cell_compressor_results results6;
+				
+				params6.m_pSelector_weights = g_bc7_weights4;
+				params6.m_pSelector_weightsx = (const vec4F *)&g_bc7_weights4x[0];
+				params6.m_num_selector_weights = 16;
 
-                params6.m_comp_bits = 7;
-                params6.m_has_pbits = true;
-                params6.m_endpoints_share_pbit = false;
-                params6.m_has_alpha = true;
-                                
-                int selectors[16];
-                color_cell_compressor_results results6;
-                results6.m_pSelectors = selectors;
+				params6.m_comp_bits = 7;
+				params6.m_has_pbits = true;
+				params6.m_endpoints_share_pbit = false;
+				params6.m_has_alpha = true;
+								
+				int selectors[16];
+				results6.m_pSelectors = selectors;
 
-                int selectors_temp6[16];
-                results6.m_pSelectors_temp = selectors_temp6;
+				int selectors_temp[16];
+				results6.m_pSelectors_temp = selectors_temp;
 
-                uint64_t mode6_err = color_cell_compression(6, &params6, &results6, pComp_params, 16, pPixels, true);
-                assert(mode6_err == results6.m_best_overall_err);
+				uint64_t mode6_err = color_cell_compression(6, &params6, &results6, pComp_params, 16, pPixels, true);
+				assert(mode6_err == results6.m_best_overall_err);
+				
+				if (mode6_err < best_err)
+				{
+						best_err = mode6_err;
 
-                // ---- RECOMPUTE FAIR ERROR ----
-                // Mode 6 was encoded with suppressed alpha weight (for good PCA).
-                // But for mode comparison, we need the TRUE error with proper alpha weighting.
-                // Recompute using original weights so the comparison is fair.
-                if (bimodal_alpha)
-                {
-                        uint64_t true_err = 0;
-                        // Decode mode 6 result to get the actual interpolated colors
-                        color_quad_i low = results6.m_low_endpoint;
-                        color_quad_i high = results6.m_high_endpoint;
-                        uint32_t p0 = results6.m_pbits[0];
-                        uint32_t p1 = results6.m_pbits[1];
-                        
-                        // Scale endpoints (7-bit + pbit = 8-bit effective)
-                        color_quad_i scaled_low, scaled_high;
-                        // Use the params6 settings for scaling
-                        for (uint32_t c = 0; c < 4; c++)
-                        {
-                                uint32_t lv = ((low.m_c[c] << 1) | p0);
-                                uint32_t hv = ((high.m_c[c] << 1) | p1);
-                                lv = (lv << 1) | (lv >> 7);  // 7-bit + pbit → 8-bit
-                                hv = (hv << 1) | (hv >> 7);
-                                scaled_low.m_c[c] = lv;
-                                scaled_high.m_c[c] = hv;
-                        }
-
-                        for (uint32_t i = 0; i < 16; i++)
-                        {
-                                uint32_t sel = selectors[i];
-                                uint32_t w = g_bc7_weights4[sel];
-                                
-                                color_quad_i decoded;
-                                for (uint32_t c = 0; c < 4; c++)
-                                        decoded.m_c[c] = (scaled_low.m_c[c] * (64 - w) + scaled_high.m_c[c] * w + 32) >> 6;
-
-                                // Compute error with ORIGINAL weights (not suppressed)
-                                int dr = decoded.m_c[0] - pPixels[i].m_c[0];
-                                int dg = decoded.m_c[1] - pPixels[i].m_c[1];
-                                int db = decoded.m_c[2] - pPixels[i].m_c[2];
-                                int da = decoded.m_c[3] - pPixels[i].m_c[3];
-
-                                // Use pParams (original) weights, not params6 (suppressed)
-                                true_err += pParams->m_weights[0] * (dr * dr);
-                                true_err += pParams->m_weights[1] * (dg * dg);
-                                true_err += pParams->m_weights[2] * (db * db);
-                                true_err += pParams->m_weights[3] * (da * da);
-                        }
-                        
-                        mode6_err = true_err;
-                }
-                
-                if (mode6_err < best_err)
-                {
-                        best_err = mode6_err;
-
-                        opt_results.m_mode = 6;
+						opt_results.m_mode = 6;
 						opt_results.m_index_selector = 0;
 						opt_results.m_rotation = 0;
 						opt_results.m_partition = 0;
@@ -3897,13 +3829,13 @@ static void handle_alpha_block(void * pBlock, const  color_quad_i * pPixels, con
 
 						handle_alpha_block_mode5(pTrial_pixels, pComp_params, &params5, trial_lo_a, trial_hi_a, &trial_opt_results5, &trial_mode5_err);
 
-                        if (trial_mode5_err < best_err)
-                        {
-                                best_err = trial_mode5_err;
+						if (trial_mode5_err < best_err)
+						{
+								best_err = trial_mode5_err;
 
-                                opt_results = trial_opt_results5;
-                                opt_results.m_rotation = rotation;
-                        }
+								opt_results = trial_opt_results5;
+								opt_results.m_rotation = rotation;
+						}
 				} // rotation
 		}
 
@@ -4091,7 +4023,6 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
 		bc7_optimization_results opt_results;
 				
 		uint64_t best_err = UINT64_MAX;
-		uint64_t best_non_3subset_err = UINT64_MAX;  // ← ADD THIS LINE
 
 		// QuickBC7 mode pruning: skip multi-subset modes for simple blocks.
 		// Luma range and distinct color count determine which modes are worth trying.
@@ -4123,7 +4054,6 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
 				results6.m_pSelectors_temp = selectors_temp;
 
 				best_err = color_cell_compression(6, pParams, &results6, pComp_params, 16, pPixels, true);
-                best_non_3subset_err = best_err;  // ← ADD
 												
 				opt_results.m_mode = 6;
 				opt_results.m_index_selector = 0;
@@ -4238,7 +4168,6 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
 						if (trial_err < best_err)
 						{
 								best_err = trial_err;
-                                best_non_3subset_err = trial_err;  // ← ADD
 
 								opt_results.m_mode = 1;
 								opt_results.m_index_selector = 0;
@@ -4314,7 +4243,6 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
 						if (trial_err < best_err)
 						{
 								best_err = trial_err;
-                                best_non_3subset_err = trial_err;  // ← ADD
 
 								for ( uint32_t subset = 0; subset < 2; subset++)
 								{
@@ -4425,11 +4353,7 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
 										break;
 						} // subset
 
-						uint64_t compare_err = best_err;
-						if (best_non_3subset_err != UINT64_MAX)
-								compare_err = best_non_3subset_err - (best_non_3subset_err >> 4);
-
-						if (mode0_err < compare_err)
+						if (mode0_err < best_err)
 						{
 								best_err = mode0_err;
 
@@ -4459,7 +4383,7 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
 		}
 				
 		// Mode 3 (2-subset, 7+1-bit color with shared pbit, 2-bit indices)
-		if (pComp_params->m_opaque_settings.m_use_mode[3] && !skip_multisubset && try_3_subset)
+		if (pComp_params->m_opaque_settings.m_use_mode[0] && !skip_multisubset && try_3_subset)
 		{
 				pParams->m_pSelector_weights = g_bc7_weights2;
 				pParams->m_pSelector_weightsx = (const vec4F *)&g_bc7_weights2x[0];
@@ -4523,7 +4447,6 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
 						if (trial_err < best_err)
 						{
 								best_err = trial_err;
-                                best_non_3subset_err = trial_err;  // ← ADD
 																				
 								opt_results.m_mode = 3;
 								opt_results.m_index_selector = 0;
@@ -4602,7 +4525,6 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
 						if (trial_err < best_err)
 						{
 								best_err = trial_err;
-                                best_non_3subset_err = trial_err;  // ← ADD
 																				
 								for ( uint32_t subset = 0; subset < 2; subset++)
 								{
@@ -4666,14 +4588,13 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
 
 						handle_alpha_block_mode5(pTrial_pixels, pComp_params, &params5, trial_lo_a, trial_hi_a, &trial_opt_results5, &trial_mode5_err);
 
-                        if (trial_mode5_err < best_err)
-                        {
-                                best_err = trial_mode5_err;
-                                best_non_3subset_err = trial_mode5_err;  // ← ADD
+						if (trial_mode5_err < best_err)
+						{
+								best_err = trial_mode5_err;
 
-                                opt_results = trial_opt_results5;
-                                opt_results.m_rotation = rotation;
-                        }
+								opt_results = trial_opt_results5;
+								opt_results.m_rotation = rotation;
+						}
 				} // rotation
 		}
 
@@ -4784,11 +4705,7 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
 										break;
 						} // subset
 
-						uint64_t compare_err = best_err;
-						if (best_non_3subset_err != UINT64_MAX)
-								compare_err = best_non_3subset_err - (best_non_3subset_err >> 4);
-
-						if (mode2_err < compare_err)
+						if (mode2_err < best_err)
 						{
 								best_err = mode2_err;
 
@@ -4859,7 +4776,6 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
 						if (trial_mode4_err < best_err)
 						{
 								best_err = trial_mode4_err;
-                                best_non_3subset_err = trial_mode4_err;  // ← ADD
 
 								opt_results.m_mode = 4;
 								opt_results.m_index_selector = trial_opt_results4.m_index_selector;
@@ -5129,14 +5045,162 @@ void bc7e_compress_block_params_init(bc7e_compress_block_params *  p,  bool perc
 		p->m_alpha_settings.m_use_mode4_rotation = true;
 		p->m_alpha_settings.m_use_mode5_rotation = true;
 		p->m_alpha_settings.m_max_mode7_partitions_to_try = 1;
-		p->m_alpha_settings.m_mode67_error_weight_mul[0] = 2;
-		p->m_alpha_settings.m_mode67_error_weight_mul[1] = 2;
-		p->m_alpha_settings.m_mode67_error_weight_mul[2] = 2;
+		p->m_alpha_settings.m_mode67_error_weight_mul[0] = 1;
+		p->m_alpha_settings.m_mode67_error_weight_mul[1] = 1;
+		p->m_alpha_settings.m_mode67_error_weight_mul[2] = 1;
 		p->m_alpha_settings.m_mode67_error_weight_mul[3] = 1;
 		p->m_uber_level = 0;
 
 		p->m_alpha_settings.m_use_mode4_rotation = false;
 		p->m_alpha_settings.m_use_mode5_rotation = false;
+}
+
+void bc7e_compress_block_params_init_slowest(bc7e_compress_block_params *  p,  bool perceptual)
+{
+		bc7e_compress_block_params_init(p, perceptual);
+
+		p->m_opaque_settings.m_max_mode13_partitions_to_try = 4;
+		p->m_opaque_settings.m_max_mode0_partitions_to_try = 4;
+		p->m_opaque_settings.m_max_mode2_partitions_to_try = 4;
+		p->m_alpha_settings.m_max_mode7_partitions_to_try = 4;
+
+		p->m_pbit_search = true;
+		p->m_uber_level = 4;
+}
+
+void bc7e_compress_block_params_init_veryslow(bc7e_compress_block_params *  p,  bool perceptual)
+{
+		bc7e_compress_block_params_init(p, perceptual);
+
+		p->m_opaque_settings.m_max_mode13_partitions_to_try = 2;
+		p->m_opaque_settings.m_max_mode0_partitions_to_try = 2;
+		p->m_opaque_settings.m_max_mode2_partitions_to_try = 2;
+		p->m_alpha_settings.m_max_mode7_partitions_to_try = 2;
+
+		p->m_pbit_search = true;
+		p->m_uber_level = 2;
+}
+
+void bc7e_compress_block_params_init_slow(bc7e_compress_block_params *  p,  bool perceptual)
+{
+		bc7e_compress_block_params_init(p, perceptual);
+
+		p->m_alpha_settings.m_max_mode7_partitions_to_try = 2;
+
+		p->m_pbit_search = true;
+		p->m_uber_level = 0;
+}
+
+void bc7e_compress_block_params_init_basic(bc7e_compress_block_params *  p,  bool perceptual)
+{
+		bc7e_compress_block_params_init(p, perceptual);
+
+		if (perceptual)
+		{
+				p->m_opaque_settings.m_use_mode[0] = false;
+				p->m_opaque_settings.m_use_mode[2] = false;
+				p->m_opaque_settings.m_use_mode[3] = false;
+				p->m_opaque_settings.m_use_mode[4] = false;
+				p->m_opaque_settings.m_use_mode[5] = false;
+				
+				p->m_pbit_search = false;
+				p->m_uber_level = 1;
+		}
+		else
+		{
+				p->m_max_partitions_mode[1] = 32;
+				p->m_max_partitions_mode[2] = 32;
+				p->m_max_partitions_mode[3] = 32;
+				p->m_max_partitions_mode[7] = 32;
+
+				p->m_opaque_settings.m_use_mode[2] = false;
+				
+				p->m_pbit_search = false;
+				p->m_uber_level = 1;
+		}
+}
+
+void bc7e_compress_block_params_init_fast(bc7e_compress_block_params *  p,  bool perceptual)
+{
+		bc7e_compress_block_params_init(p, perceptual);
+
+		if (perceptual)
+		{
+				p->m_opaque_settings.m_use_mode[0] = false;
+				p->m_opaque_settings.m_use_mode[2] = false;
+				p->m_opaque_settings.m_use_mode[3] = false;
+				p->m_opaque_settings.m_use_mode[4] = false;
+				p->m_opaque_settings.m_use_mode[5] = false;
+
+				p->m_alpha_settings.m_use_mode5 = false;
+		
+				p->m_opaque_settings.m_max_mode13_partitions_to_try = 1;
+				
+				p->m_pbit_search = false;
+				p->m_uber_level = 0;
+		}               
+		else
+		{
+				p->m_opaque_settings.m_use_mode[0] = false;
+				p->m_opaque_settings.m_use_mode[2] = false;
+				p->m_opaque_settings.m_use_mode[4] = false;
+				p->m_opaque_settings.m_use_mode[5] = false;
+
+				p->m_alpha_settings.m_use_mode5 = false;
+		
+				p->m_opaque_settings.m_max_mode13_partitions_to_try = 2;
+				
+				p->m_pbit_search = false;
+				p->m_uber_level = 0;
+		}
+}
+
+void bc7e_compress_block_params_init_veryfast(bc7e_compress_block_params *  p,  bool perceptual)
+{
+		bc7e_compress_block_params_init(p, perceptual);
+
+		if (perceptual)
+		{
+				p->m_opaque_settings.m_use_mode[0] = false;
+				p->m_opaque_settings.m_use_mode[2] = false;
+				p->m_opaque_settings.m_use_mode[3] = false;
+				p->m_opaque_settings.m_use_mode[4] = false;
+				p->m_opaque_settings.m_use_mode[5] = false;
+
+				p->m_alpha_settings.m_use_mode5 = false;
+				
+				p->m_pbit_search = false;
+				p->m_uber_level = 0;
+		}
+		else
+		{
+				p->m_opaque_settings.m_use_mode[2] = false;
+				p->m_opaque_settings.m_use_mode[4] = false;
+				p->m_opaque_settings.m_use_mode[5] = false;
+
+				p->m_alpha_settings.m_use_mode5 = false;
+				
+				p->m_pbit_search = false;
+				p->m_uber_level = 0;
+		}
+}
+
+void bc7e_compress_block_params_init_ultrafast(bc7e_compress_block_params *  p,  bool perceptual)
+{
+		bc7e_compress_block_params_init(p, perceptual);
+
+		p->m_mode6_only = true;
+
+		p->m_alpha_settings.m_use_mode4 = true;
+		p->m_alpha_settings.m_use_mode5 = true;
+		p->m_alpha_settings.m_use_mode7 = false;
+
+		p->m_mode4_rotation_mask = 1+4;
+		p->m_mode4_index_mask = 3;
+		p->m_mode5_rotation_mask = 1;
+								
+		p->m_pbit_search = false;
+		p->m_uber_level = 0;
 }
 
 // Thread-safe: compresses blocks[first..first+count) using pre-initialized codec.
