@@ -137,7 +137,7 @@ public:
         return "Scalar (Atomic Work Stealing)";
     }
 
-    void encode_image_mt(const uint8_t* rgba, int w, int h, bool perceptual, std::vector<uint8_t>& bc7_out) {
+    void encode_image_mt(const uint8_t* rgba, int w, int h, std::vector<uint8_t>& bc7_out) {
         const int BW = 4, BH = 4;
         int bx_count = (w + BW - 1) / BW;
         int by_count = (h + BH - 1) / BH;
@@ -163,16 +163,12 @@ public:
             }
         }
 
-        perceptualMode = perceptual;
-
         // Quality 2 (default/balanced)
         bc7e_compress_block_params params;
-        bc7e_compress_block_params_init(&params, perceptual);
-
-        // Override AFTER init — don't touch the init function itself
-        //params.m_opaque_settings.m_use_mode[3] = false;
-        //params.m_opaque_settings.m_use_mode[2] = false;
-        //printf("UBER LEVEL: %d\n", params.m_uber_level);
+        bc7e_compress_block_params_init(&params, false);
+        params.m_pbit_search = false;
+        params.m_refinement_passes = 2;
+        //params.m_uber_level = 1;   // enables the PCA seed improvement (mode 1/3)
 
         // bc7e_compress_block_init() initializes the codec's lookup tables
         // (defined in bc7_encoder_base.h, independent of any SIMD path).
@@ -242,7 +238,6 @@ private:
     // Hard-point the function pointer at the scalar implementation from base.h.
     // No CPUID detection, no SIMD fallback ladder, no per-thread dispatch cache.
     static const compress_fn g_encode_fn;
-    bool perceptualMode;
 };
 
 // Initialize the static function pointer
@@ -310,13 +305,12 @@ static void generate_mode_visualization(const char* filename, const uint8_t* bc7
 int main(int argc, char* argv[])
 {
     if (argc < 3) {
-        fprintf(stderr, "Usage: %s <input.png> <output.dds> <perceptualmode 1 or 0>\n", argv[0]);
+        fprintf(stderr, "Usage: %s <input.png> <output.dds>\n", argv[0]);
         return 1;
     }
 
     const char* in_path = argv[1];
     const char* out_path = argv[2];
-    const bool percep_mode = argv[3] != nullptr;
 
     int w = 0, h = 0, ch = 0;
     uint8_t* pixels = stbi_load(in_path, &w, &h, &ch, 4);
@@ -325,11 +319,11 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    fprintf(stderr, "Loaded %dx%d image \"%s\" (%d ch) - PERCEPTUAL MODE: %s\n", w, h, in_path, ch, percep_mode ? "ON" : "OFF");
+    fprintf(stderr, "Loaded %dx%d image \"%s\" - %d channels\n", w, h, in_path, ch);
 
     BC7Encoder encoder;
     std::vector<uint8_t> bc7;
-    encoder.encode_image_mt(pixels, w, h, percep_mode, bc7);
+    encoder.encode_image_mt(pixels, w, h, bc7);
 
     size_t orig = (size_t)w * h * 4;
     fprintf(stderr, "Original: %zu bytes, BC7: %zu bytes (%.2f:1, %.1f%%)\n",

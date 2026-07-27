@@ -42,8 +42,8 @@ static inline T ispc_select(bool cond, T a, T b) { return cond ? a : b; }
 #define BC7E_MAX_PARTITIONS0 (8)
 #define BC7E_MAX_PARTITIONS1 (16) // set from 32 to 16
 #define BC7E_MAX_PARTITIONS2 (16) // keep this at 16 minimum
-#define BC7E_MAX_PARTITIONS3 (16) // was 32 but i dont think mode 3 uhhhhhhh
-#define BC7E_MAX_PARTITIONS7 (64)
+#define BC7E_MAX_PARTITIONS3 (32) // was 32 but i dont think mode 3 uhhhhhhh
+#define BC7E_MAX_PARTITIONS7 (32)
 #define BC7E_MAX_UBER_LEVEL (4)
 
 // typedef unsigned int8 uint8_t;  [replaced by <cstdint>]
@@ -1073,8 +1073,8 @@ static inline void color_cell_compressor_params_clear( color_cell_compressor_par
 		p->m_comp_bits = 0;
 		p->m_perceptual = false;
 		p->m_weights[0] = 1;
-		p->m_weights[1] = 1;
-		p->m_weights[2] = 1;
+		p->m_weights[1] = 2;
+		p->m_weights[2] = 2;
 		p->m_weights[3] = 1;
 		p->m_has_alpha = false;
 		p->m_has_pbits = false;
@@ -1172,13 +1172,6 @@ static inline uint64_t compute_color_distance_rgba(const color_quad_i * pE1, con
         
         rgb_err = weights[0] * dr * dr + weights[1] * dg * dg + weights[2] * db * db;
     }
-
-    // === NEW PSNR BOOST FOR SPRITESHEETS ===
-    // Multiply the RGB error by the pixel's actual visibility (alpha / 255).
-    // If a pixel is fully transparent (alpha 0), RGB error becomes 0. 
-    // The encoder will stop wasting bits on invisible pixels.
-    float visibility = (float)pE1->m_c[3] * (1.0f / 255.0f);
-    rgb_err *= visibility;
     // =========================================
 
     return (int64_t)(rgb_err + a_err);
@@ -1545,7 +1538,7 @@ static uint64_t evaluate_solution(const color_quad_i *pLow, const color_quad_i *
 						int dr = (int)interp_r[s] - pC->m_c[0];
 						int dg = (int)interp_g[s] - pC->m_c[1];
 						int db = (int)interp_b[s] - pC->m_c[2];
-						uint32_t err = (uint32_t)(dr*dr + dg*dg + db*db);
+						uint32_t err = (uint32_t)(wr*(dr*dr) + wg*(dg*dg) + wb*(db*db));
 						if (err < best_err) { best_err = err; best_sel = s; }
 					}
      pixel_err[i] = (float)best_err;
@@ -1617,8 +1610,8 @@ static uint64_t evaluate_solution(const color_quad_i *pLow, const color_quad_i *
 						int dg = (int)interp_g[s] - pC->m_c[1];
 						int db = (int)interp_b[s] - pC->m_c[2];
 						int da = (int)interp_a[s] - pC->m_c[3];
-						uint32_t err = (uint32_t)(dr*dr + dg*dg + db*db + da*da);
-						if (err < best_err) { best_err = err; best_sel = s; }
+						int err = wr*dr*dr + wg*dg*dg + wb*db*db + wa*da*da;
+						if (err < best_err) { best_err = err; best_sel = (int)s; }
 					}
      pixel_err[i] = (float)best_err;
 					total_errf += best_err;
@@ -1686,12 +1679,11 @@ static uint64_t evaluate_solution(const color_quad_i *pLow, const color_quad_i *
 				// semi-transparent gradient regions. Opaque pixels (alpha=255)
 				// get weight=1, so opaque blocks are completely unaffected.
 				float aw = a * (1.0f / 255.0f);
-				float awsq = aw * aw;
 				float best_err = 1e+10f; int32_t best_sel;
 				for (uint32_t j = 0; j < N; j++) {
 					float dl = y - weightedColorsY[j]; float dcr = cr - weightedColorsCr[j]; float dcb = cb - weightedColorsCb[j]; float da = a - weightedColors[j].m_c[3];
 					float rgb_err = (wr * dl * dl) + (wg * dcr * dcr) + (wb * dcb * dcb);
-					float err = awsq * rgb_err + (wa * da * da);
+					float err = aw * rgb_err + (wa * da * da);
 					if (err < best_err) { best_err = err; best_sel = j; }
 				}
     pixel_err[i] = (float)best_err;
@@ -3762,6 +3754,7 @@ static void handle_alpha_block(void * pBlock, const  color_quad_i * pPixels, con
 {
 	pParams->m_perceptual = pComp_params->m_perceptual;
 	bc7_optimization_results opt_results;
+	memset(&opt_results, 0, sizeof(opt_results));
 	uint64_t best_err = UINT64_MAX;
 
 	// Compute per-channel min/max for Mode 4/5 precision checks
@@ -3773,20 +3766,50 @@ static void handle_alpha_block(void * pBlock, const  color_quad_i * pPixels, con
 		if (b < lo_b) lo_b = b; if (b > hi_b) hi_b = b;
 	}
 
+	/*color_quad_i clean_pixels[16];
+	const color_quad_i * pEncPixels = pPixels;
+	if (lo_a == 0 && hi_a > 0)
+	{
+		float sr = 0, sg = 0, sb = 0;
+		int vc = 0;
+		for (int i = 0; i < 16; i++) {
+			if (pPixels[i].m_c[3] > 16) {
+				sr += pPixels[i].m_c[0];
+				sg += pPixels[i].m_c[1];
+				sb += pPixels[i].m_c[2];
+				vc++;
+			}
+		}
+		if (vc > 0 && vc < 16) {
+			memcpy(clean_pixels, pPixels, sizeof(clean_pixels));
+			int ar = (int)(sr / vc + 0.5f);
+			int ag = (int)(sg / vc + 0.5f);
+			int ab = (int)(sb / vc + 0.5f);
+			for (int i = 0; i < 16; i++) {
+				if (clean_pixels[i].m_c[3] <= 16) {
+					clean_pixels[i].m_c[0] = ar;
+					clean_pixels[i].m_c[1] = ag;
+					clean_pixels[i].m_c[2] = ab;
+				}
+			}
+			pEncPixels = clean_pixels;
+		}
+	}*/
+
 	// QuickBC7 alpha mode pruning
 	const int alpha_range = (int)(hi_a - lo_a);
 	const int ndc = pStats->num_distinct_colors;
 	const int luma_range = pStats->max_luma - pStats->min_luma;
 
 	// If very few distinct colors, multi-subset mode 7 is pointless.
-	const bool skip_mode7 = (ndc <= 3) || (luma_range <= 8 && pStats->luma_var < 64);
+	const bool skip_mode7 = (ndc <= 3) || (luma_range <= 16 && pStats->luma_var < 128);
 
 	// Mode 4 - SKIP when color range exceeds 5-bit precision capacity
 	const int color_range_r = (int)(hi_r - lo_r);
 	const int color_range_g = (int)(hi_g - lo_g);
 	const int color_range_b = (int)(hi_b - lo_b);
 	const int max_color_range = maximumi(maximumi(color_range_r, color_range_g), color_range_b);
-	const bool skip_mode4 = (max_color_range > 20); // 5-bit can't handle large ranges
+	const bool skip_mode4 = (max_color_range > 64); // 5-bit can't handle large ranges
 	
 	// Mode 4
 	if (pComp_params->m_alpha_settings.m_use_mode4 && !skip_mode4)
@@ -3837,7 +3860,8 @@ static void handle_alpha_block(void * pBlock, const  color_quad_i * pPixels, con
 	
 	// Mode 6 - MUST REMAIN ACTIVE AS FALLBACK!
 	// The original bimodal alpha fix is restored here to prevent PCA starvation.
-	if (pComp_params->m_alpha_settings.m_use_mode6 & !bimodal_alpha)
+	const bool near_opaque = (lo_a >= 240);
+	if (pComp_params->m_alpha_settings.m_use_mode6 && !bimodal_alpha && near_opaque)
 	{
 		 color_cell_compressor_params params6 = *pParams;
 		params6.m_weights[0] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[0];
@@ -3925,7 +3949,7 @@ static void handle_alpha_block(void * pBlock, const  color_quad_i * pPixels, con
 		int max_color_range_m5 = maximumi(maximumi(max_r-min_r, max_g-min_g), max_b-min_b);
 		
 		// 4 levels can only handle a range of ~12-16 before banding becomes obvious.
-		if (max_color_range_m5 < 16)
+		if (max_color_range_m5 < 128) // 64 really makes a difference here.
 		{
 			color_cell_compressor_params params5 = *pParams;
 			const  int num_rotations = (pComp_params->m_perceptual || (!pComp_params->m_alpha_settings.m_use_mode5_rotation)) ? 2 : 4;
@@ -3967,7 +3991,8 @@ static void handle_alpha_block(void * pBlock, const  color_quad_i * pPixels, con
 	}
 
 	// Mode 7 (2-subset, 5-bit RGBA with pbits, 2-bit indices)
-	if (pComp_params->m_alpha_settings.m_use_mode7 && (!skip_mode7 || bimodal_alpha))
+	const bool need_mode7_fallback = !near_opaque && !bimodal_alpha;
+	if (pComp_params->m_alpha_settings.m_use_mode7 && (!skip_mode7 || bimodal_alpha || need_mode7_fallback))
 	{
 		solution solutions[BC7E_MAX_PARTITIONS7];
 		uint32_t num_solutions = estimate_partition_list(7, pPixels, pComp_params, solutions, pComp_params->m_alpha_settings.m_max_mode7_partitions_to_try);
@@ -4499,7 +4524,7 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
 						}
 				
 		// Mode 3 (2-subset, 7+1-bit color with shared pbit, 2-bit indices)
-		if (pComp_params->m_opaque_settings.m_use_mode[0] && !skip_multisubset && try_3_subset)
+		if (pComp_params->m_opaque_settings.m_use_mode[3] && !skip_multisubset && try_3_subset)
 		{
 				pParams->m_pSelector_weights = g_bc7_weights2;
 				pParams->m_pSelector_weightsx = (const vec4F *)&g_bc7_weights2x[0];
@@ -5147,9 +5172,9 @@ void bc7e_compress_block_params_init(bc7e_compress_block_params *  p,  bool perc
 		}
 		else
 		{
-				p->m_weights[0] = 1;
-				p->m_weights[1] = 1;
-				p->m_weights[2] = 1;
+				p->m_weights[0] = 2;
+				p->m_weights[1] = 2;
+				p->m_weights[2] = 2;
 				p->m_weights[3] = 1;
 		}
 
@@ -5161,7 +5186,7 @@ void bc7e_compress_block_params_init(bc7e_compress_block_params *  p,  bool perc
 		p->m_mode5_rotation_mask = 0xF;
 		p->m_uber1_mask = 7;
 
-		p->m_opaque_settings.m_use_mode[0] = true;
+		p->m_opaque_settings.m_use_mode[0] = false;
 		p->m_opaque_settings.m_use_mode[1] = true;
 		p->m_opaque_settings.m_use_mode[2] = true;
 		p->m_opaque_settings.m_use_mode[3] = true;
@@ -5180,15 +5205,14 @@ void bc7e_compress_block_params_init(bc7e_compress_block_params *  p,  bool perc
 		p->m_alpha_settings.m_use_mode7 = true;
 		p->m_alpha_settings.m_use_mode4_rotation = true;
 		p->m_alpha_settings.m_use_mode5_rotation = true;
-		p->m_alpha_settings.m_max_mode7_partitions_to_try = 1;
-		p->m_alpha_settings.m_mode67_error_weight_mul[0] = 1;
-		p->m_alpha_settings.m_mode67_error_weight_mul[1] = 1;
-		p->m_alpha_settings.m_mode67_error_weight_mul[2] = 1;
+		p->m_alpha_settings.m_max_mode7_partitions_to_try = 2;
+		p->m_alpha_settings.m_mode67_error_weight_mul[0] = 2;
+		p->m_alpha_settings.m_mode67_error_weight_mul[1] = 2;
+		p->m_alpha_settings.m_mode67_error_weight_mul[2] = 2;
 		p->m_alpha_settings.m_mode67_error_weight_mul[3] = 1;
 		p->m_uber_level = 0;
 
 		p->m_alpha_settings.m_use_mode4_rotation = false;
-		p->m_alpha_settings.m_use_mode5_rotation = false;
 }
 
 void bc7e_compress_block_params_init_slowest(bc7e_compress_block_params *  p,  bool perceptual)
@@ -5411,7 +5435,7 @@ static void bc7e_compress_block_range(
 				compute_block_stats(&stats, temp_pixels);
 
 				const bool has_alpha_final = (lo_a < 255.0f);
-				const bool bimodal_alpha = (stats.min_alpha < 32 && stats.max_alpha >= 224);
+				const bool bimodal_alpha = (stats.min_alpha < 64 && stats.max_alpha >= 128);
 
 				if (has_alpha_final)
 						handle_alpha_block(pBlock, temp_pixels, pComp_params, &params, (int)lo_a, (int)hi_a, &stats, bimodal_alpha);
