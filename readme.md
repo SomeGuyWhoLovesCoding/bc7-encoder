@@ -1,12 +1,16 @@
 ## BC7 Encoder
 
-This version actually knows what it's doing and optimizes for any real world texture with minimal compilation setup. It is completely beginner friendly and that's it.
+I'm serious, this version actually knows what it's doing and optimizes for any real world texture with minimal compilation setup.
+
+It is completely beginner friendly and that's it.
+
+And there's also minimal quality loss too, and even a perceptual mode that's enabled with just inputting "1" as the third argument of the commandlist. My use-case stands, and I will always automate bc7 encoding with the highest quality possible whilst retaining the nice efficiency I get!
 
 Now for PSNR comparison...
 
 ![Oop! One pixel difference.](barchart.png)
 
-Yep. Mine's virtually identical, and also (possibly) better quality than others, except it's multitudes faster because I just observed the exact speed of each of the encoders on the list and have done vastly big amounts of other plentiful optimizations, including but not limited to mode stealing (which does ).
+Yep. Mine's virtually identical, and also (possibly) better quality than others, except it's multitudes faster because I just observed the exact speed of each of the encoders on the list and have done vastly big amounts of other plentiful optimizations, including but not limited to pixel deduplication.
 
 ---
 
@@ -30,11 +34,11 @@ It's also a waste of the GPU's resource, but I was thinking for bit "why not jus
 
 You've never heard of this person, because he's had this strange but super-niche hobby of a specific texture compression known as bc7, where he tries to experiment with optimizing it, such as RDO for example (**Rate Distortion Optimization**), and even programming the whole ass encoder in ispc, which added a few MORE layers of compelxity.
 
-Fuck it, the ISPC version of bc7 compression was discontinued and so you , and intel themselves have ceased all future updates of it.
+*This tool's based on their his bc7e_rdo ispc code though!*
+
+Fuck it, the ISPC version of bc7 compression was discontinued, as intel themselves have ceased all future updates of it, and so you can run it on any dekstop platform now.
 
 When going to basis universal (which I actually found about very early on in my bc7 compression rabbithole), I saw it as a bulky ass compressed texture transcoder, which does not fit my purpose at all.
-
-*This tool's based on their ispc code though!*
 
 It does have bc7f in it, whichh... Eh, not really gonna bother.
 

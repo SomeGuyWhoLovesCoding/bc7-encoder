@@ -28,7 +28,7 @@
 // tail latency from variable block compression times.
 
 #include "bc7_encoder_base.h"
-//#include "bc7_metrics.h"
+#include "bc7_metrics.h"
 
 // NOTE: bc7_encoder_simd.h, bc7_encoder_dispatch.h, and
 // bc7_encoder_simd_impl.inc are intentionally NOT included.
@@ -170,7 +170,7 @@ public:
         bc7e_compress_block_params_init(&params, perceptual);
 
         // Override AFTER init — don't touch the init function itself
-        params.m_opaque_settings.m_use_mode[3] = false;
+        //params.m_opaque_settings.m_use_mode[3] = false;
         //params.m_opaque_settings.m_use_mode[2] = false;
         //printf("UBER LEVEL: %d\n", params.m_uber_level);
 
@@ -354,7 +354,7 @@ int main(int argc, char* argv[])
     generate_mode_visualization(mode_vis_path.c_str(), bc7.data(), w, h);
 
     // ── Quality Metrics (matches bc7enc output format) ──
-    // compute_and_print_all_metrics(pixels, bc7.data(), bc7.size(), w, h);
+    compute_and_print_all_metrics(pixels, bc7.data(), bc7.size(), w, h);
 
     stbi_image_free(pixels);
     return 0;

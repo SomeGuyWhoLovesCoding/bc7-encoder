@@ -1,2 +1,4 @@
 *.exe
 *.obj
+# oh it was just a random python script i had generated with ai and stuff idk
+bench/

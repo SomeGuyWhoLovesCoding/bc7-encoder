@@ -643,6 +643,18 @@ struct mode6_lut_entry {
 // [256 input values][2 high p-bits][2 low p-bits]
 static mode6_lut_entry g_bc7_mode6_lut[256][2][2];
 
+// ============================================================================
+// Mode 0 p-bit prediction LUT
+// For each 8-bit input channel value c (0..255) and each p-bit p (0 or 1),
+// stores the squared quantization error between c and the closest
+// representable mode-0 endpoint value with that p-bit.
+// Mode 0 endpoints: 4-bit + 1 p-bit = 5 bits, scaled to 8 bits via
+// bit replication: v8 = (k << 3) | (k >> 2)  where k = (ev << 1) | p.
+// Used by find_optimal_solution() to predict the best (p0, p1) p-bit
+// combination without running 4 full evaluate_solution() calls.
+// ============================================================================
+static uint32_t g_bc7_mode0_lut[256][2];
+
 static  uint32_t g_bc7_mode_4_optimal_endpoints3[256]; // [c]
 static  uint32_t g_bc7_mode_4_optimal_endpoints2[256]; // [c]
 const  uint32_t BC7E_MODE_4_OPTIMAL_INDEX3 = 2;
@@ -694,6 +706,31 @@ void bc7e_compress_block_init()
 						} // lp
 				} // hp
 		} // c
+
+		// ============================================================================
+		// Mode 0 p-bit quantization error LUT
+		// For each 8-bit input value c and p-bit p, compute the squared error
+		// between c and the closest representable mode-0 endpoint value.
+		// Mode 0 endpoints: 4-bit ev + p-bit p -> 5-bit k = (ev<<1)|p
+		// Scaled to 8-bit: v8 = (k << 3) | (k >> 2)  [bit replication]
+		// ============================================================================
+		for ( int c = 0; c < 256; c++)
+		{
+				for ( uint32_t p = 0; p < 2; p++)
+				{
+					 uint32_t best_err = UINT32_MAX;
+					for ( uint32_t ev = 0; ev < 16; ev++)
+					{
+						 uint32_t k = (ev << 1) | p;
+						 uint32_t v8 = (k << 3) | (k >> 2);
+						const  int diff = (int)v8 - c;
+						const  uint32_t err = (uint32_t)(diff * diff);
+						if (err < best_err)
+							best_err = err;
+					}
+					g_bc7_mode0_lut[c][p] = best_err;
+				}
+		}
 
 		// Mode 1: 666.1
 		for ( int c = 0; c < 256; c++)
@@ -1460,6 +1497,27 @@ static uint64_t evaluate_solution(const color_quad_i *pLow, const color_quad_i *
 		for (uint32_t j = 0; j < nc; j++)
 			weightedColors[i].m_c[j] = floor((weightedColors[0].m_c[j] * (64.0f - pParams->m_pSelector_weights[i]) + weightedColors[N - 1].m_c[j] * pParams->m_pSelector_weights[i] + 32) * (1.0f / 64.0f));
 
+	// =====================================================================
+	// PIXEL DEDUPLICATION CACHE (Optimization #5)
+	// dup_of[i] = j if pixel i is identical to pixel j (j < i), else -1.
+	// Duplicate pixels skip the selector search and reuse cached results.
+	// =====================================================================
+	int dup_of[16];
+	{
+		const uint32_t nc_check = pParams->m_has_alpha ? 4 : 3;
+		for (uint32_t i = 0; i < num_pixels; i++) {
+			dup_of[i] = -1;
+			for (uint32_t j = 0; j < i; j++) {
+				bool same = true;
+				for (uint32_t c = 0; c < nc_check; c++) {
+					if (pPixels[i].m_c[c] != pPixels[j].m_c[c]) { same = false; break; }
+				}
+				if (same) { dup_of[i] = (int)j; break; }
+			}
+		}
+	}
+	float pixel_err[16];
+
 	if (!pParams->m_perceptual)
 	{
 		if (!pParams->m_has_alpha)
@@ -1479,6 +1537,7 @@ static uint64_t evaluate_solution(const color_quad_i *pLow, const color_quad_i *
 					interp_b[s] = (uint8_t)(((64 - w) * actualMinColor.m_c[2] + w * actualMaxColor.m_c[2] + 32) >> 6);
 				}
 				for (uint32_t i = 0; i < num_pixels; i++) {
+     if (dup_of[i] >= 0) { pResults->m_pSelectors_temp[i] = pResults->m_pSelectors_temp[dup_of[i]]; total_errf += pixel_err[dup_of[i]]; continue; }
 					const color_quad_i *pC = &pPixels[i];
 					uint32_t best_err = UINT32_MAX;
 					int best_sel = 0;
@@ -1489,6 +1548,7 @@ static uint64_t evaluate_solution(const color_quad_i *pLow, const color_quad_i *
 						uint32_t err = (uint32_t)(dr*dr + dg*dg + db*db);
 						if (err < best_err) { best_err = err; best_sel = s; }
 					}
+     pixel_err[i] = (float)best_err;
 					total_errf += best_err;
 					pResults->m_pSelectors_temp[i] = best_sel;
 				}
@@ -1496,6 +1556,7 @@ static uint64_t evaluate_solution(const color_quad_i *pLow, const color_quad_i *
 			else if (N == 8)
 			{
 				for (uint32_t i = 0; i < num_pixels; i++) {
+     if (dup_of[i] >= 0) { pResults->m_pSelectors_temp[i] = pResults->m_pSelectors_temp[dup_of[i]]; total_errf += pixel_err[dup_of[i]]; continue; }
 					float pr = (float)pPixels[i].m_c[0]; float pg = (float)pPixels[i].m_c[1]; float pb = (float)pPixels[i].m_c[2];
 					float best_err; int best_sel;
 					{
@@ -1512,18 +1573,21 @@ static uint64_t evaluate_solution(const color_quad_i *pLow, const color_quad_i *
 						float dr3 = weightedColors[7].m_c[0] - pr; float dg3 = weightedColors[7].m_c[1] - pg; float db3 = weightedColors[7].m_c[2] - pb; float err3 = wr * dr3 * dr3 + wg * dg3 * dg3 + wb * db3 * db3;
 						best_err = min(best_err, min(min(min(err0, err1), err2), err3)); best_sel = ispc_select(best_err == err0, 4, best_sel); best_sel = ispc_select(best_err == err1, 5, best_sel); best_sel = ispc_select(best_err == err2, 6, best_sel); best_sel = ispc_select(best_err == err3, 7, best_sel);
 					}
+     pixel_err[i] = (float)best_err;
 					total_errf += best_err; pResults->m_pSelectors_temp[i] = best_sel;
 				}
 			}
 			else // N == 4
 			{
 				for (uint32_t i = 0; i < num_pixels; i++) {
+     if (dup_of[i] >= 0) { pResults->m_pSelectors_temp[i] = pResults->m_pSelectors_temp[dup_of[i]]; total_errf += pixel_err[dup_of[i]]; continue; }
 					float pr = (float)pPixels[i].m_c[0]; float pg = (float)pPixels[i].m_c[1]; float pb = (float)pPixels[i].m_c[2];
 					float dr0 = weightedColors[0].m_c[0] - pr; float dg0 = weightedColors[0].m_c[1] - pg; float db0 = weightedColors[0].m_c[2] - pb; float err0 = wr * dr0 * dr0 + wg * dg0 * dg0 + wb * db0 * db0;
 					float dr1 = weightedColors[1].m_c[0] - pr; float dg1 = weightedColors[1].m_c[1] - pg; float db1 = weightedColors[1].m_c[2] - pb; float err1 = wr * dr1 * dr1 + wg * dg1 * dg1 + wb * db1 * db1;
 					float dr2 = weightedColors[2].m_c[0] - pr; float dg2 = weightedColors[2].m_c[1] - pg; float db2 = weightedColors[2].m_c[2] - pb; float err2 = wr * dr2 * dr2 + wg * dg2 * dg2 + wb * db2 * db2;
 					float dr3 = weightedColors[3].m_c[0] - pr; float dg3 = weightedColors[3].m_c[1] - pg; float db3 = weightedColors[3].m_c[2] - pb; float err3 = wr * dr3 * dr3 + wg * dg3 * dg3 + wb * db3 * db3;
 					float best_err = min(min(min(err0, err1), err2), err3); int best_sel = ispc_select(best_err == err1, 1, 0); best_sel = ispc_select(best_err == err2, 2, best_sel); best_sel = ispc_select(best_err == err3, 3, best_sel);
+     pixel_err[i] = (float)best_err;
 					total_errf += best_err; pResults->m_pSelectors_temp[i] = best_sel;
 				}
 			}
@@ -1544,6 +1608,7 @@ static uint64_t evaluate_solution(const color_quad_i *pLow, const color_quad_i *
 					interp_a[s] = (uint8_t)(((64 - w) * actualMinColor.m_c[3] + w * actualMaxColor.m_c[3] + 32) >> 6);
 				}
 				for (uint32_t i = 0; i < num_pixels; i++) {
+     if (dup_of[i] >= 0) { pResults->m_pSelectors_temp[i] = pResults->m_pSelectors_temp[dup_of[i]]; total_errf += pixel_err[dup_of[i]]; continue; }
 					const color_quad_i *pC = &pPixels[i];
 					uint32_t best_err = UINT32_MAX;
 					int best_sel = 0;
@@ -1555,6 +1620,7 @@ static uint64_t evaluate_solution(const color_quad_i *pLow, const color_quad_i *
 						uint32_t err = (uint32_t)(dr*dr + dg*dg + db*db + da*da);
 						if (err < best_err) { best_err = err; best_sel = s; }
 					}
+     pixel_err[i] = (float)best_err;
 					total_errf += best_err;
 					pResults->m_pSelectors_temp[i] = best_sel;
 				}
@@ -1562,6 +1628,7 @@ static uint64_t evaluate_solution(const color_quad_i *pLow, const color_quad_i *
 			else if (N == 8)
 			{
 				for (uint32_t i = 0; i < num_pixels; i++) {
+     if (dup_of[i] >= 0) { pResults->m_pSelectors_temp[i] = pResults->m_pSelectors_temp[dup_of[i]]; total_errf += pixel_err[dup_of[i]]; continue; }
 					float pr = (float)pPixels[i].m_c[0]; float pg = (float)pPixels[i].m_c[1]; float pb = (float)pPixels[i].m_c[2]; float pa = (float)pPixels[i].m_c[3];
 					float best_err; int best_sel;
 					{
@@ -1578,18 +1645,21 @@ static uint64_t evaluate_solution(const color_quad_i *pLow, const color_quad_i *
 						float dr3 = weightedColors[7].m_c[0] - pr; float dg3 = weightedColors[7].m_c[1] - pg; float db3 = weightedColors[7].m_c[2] - pb; float da3 = weightedColors[7].m_c[3] - pa; float err3 = wr * dr3 * dr3 + wg * dg3 * dg3 + wb * db3 * db3 + wa * da3 * da3;
 						best_err = min(best_err, min(min(min(err0, err1), err2), err3)); best_sel = ispc_select(best_err == err0, 4, best_sel); best_sel = ispc_select(best_err == err1, 5, best_sel); best_sel = ispc_select(best_err == err2, 6, best_sel); best_sel = ispc_select(best_err == err3, 7, best_sel);
 					}
+     pixel_err[i] = (float)best_err;
 					total_errf += best_err; pResults->m_pSelectors_temp[i] = best_sel;
 				}
 			}
 			else // N == 4
 			{
 				for (uint32_t i = 0; i < num_pixels; i++) {
+     if (dup_of[i] >= 0) { pResults->m_pSelectors_temp[i] = pResults->m_pSelectors_temp[dup_of[i]]; total_errf += pixel_err[dup_of[i]]; continue; }
 					float pr = (float)pPixels[i].m_c[0]; float pg = (float)pPixels[i].m_c[1]; float pb = (float)pPixels[i].m_c[2]; float pa = (float)pPixels[i].m_c[3];
 					float dr0 = weightedColors[0].m_c[0] - pr; float dg0 = weightedColors[0].m_c[1] - pg; float db0 = weightedColors[0].m_c[2] - pb; float da0 = weightedColors[0].m_c[3] - pa; float err0 = wr * dr0 * dr0 + wg * dg0 * dg0 + wb * db0 * db0 + wa * da0 * da0;
 					float dr1 = weightedColors[1].m_c[0] - pr; float dg1 = weightedColors[1].m_c[1] - pg; float db1 = weightedColors[1].m_c[2] - pb; float da1 = weightedColors[1].m_c[3] - pa; float err1 = wr * dr1 * dr1 + wg * dg1 * dg1 + wb * db1 * db1 + wa * da1 * da1;
 					float dr2 = weightedColors[2].m_c[0] - pr; float dg2 = weightedColors[2].m_c[1] - pg; float db2 = weightedColors[2].m_c[2] - pb; float da2 = weightedColors[2].m_c[3] - pa; float err2 = wr * dr2 * dr2 + wg * dg2 * dg2 + wb * db2 * db2 + wa * da2 * da2;
 					float dr3 = weightedColors[3].m_c[0] - pr; float dg3 = weightedColors[3].m_c[1] - pg; float db3 = weightedColors[3].m_c[2] - pb; float da3 = weightedColors[3].m_c[3] - pa; float err3 = wr * dr3 * dr3 + wg * dg3 * dg3 + wb * db3 * db3 + wa * da3 * da3;
 					float best_err = min(min(min(err0, err1), err2), err3); int best_sel = ispc_select(best_err == err1, 1, 0); best_sel = ispc_select(best_err == err2, 2, best_sel); best_sel = ispc_select(best_err == err3, 3, best_sel);
+     pixel_err[i] = (float)best_err;
 					total_errf += best_err; pResults->m_pSelectors_temp[i] = best_sel;
 				}
 			}
@@ -1606,18 +1676,30 @@ static uint64_t evaluate_solution(const color_quad_i *pLow, const color_quad_i *
 		}
 		if (pParams->m_has_alpha) {
 			for (uint32_t i = 0; i < num_pixels; i++) {
+    if (dup_of[i] >= 0) { pResults->m_pSelectors_temp[i] = pResults->m_pSelectors_temp[dup_of[i]]; total_errf += pixel_err[dup_of[i]]; continue; }
 				float r = pPixels[i].m_c[0]; float g = pPixels[i].m_c[1]; float b = pPixels[i].m_c[2]; float a = pPixels[i].m_c[3];
 				float y = r * .2126f + g * .7152f + b * .0722f; float cr = r - y; float cb = b - y;
+				// GLOW FIX: Premultiplied alpha error weighting.
+				// Weight RGB error by (alpha/255)² so transparent pixels' RGB
+				// (often garbage from the image pipeline) doesn't poison endpoint/
+				// selector optimization. This eliminates blocky-glow seams in
+				// semi-transparent gradient regions. Opaque pixels (alpha=255)
+				// get weight=1, so opaque blocks are completely unaffected.
+				float aw = a * (1.0f / 255.0f);
+				float awsq = aw * aw;
 				float best_err = 1e+10f; int32_t best_sel;
 				for (uint32_t j = 0; j < N; j++) {
 					float dl = y - weightedColorsY[j]; float dcr = cr - weightedColorsCr[j]; float dcb = cb - weightedColorsCb[j]; float da = a - weightedColors[j].m_c[3];
-					float err = (wr * dl * dl) + (wg * dcr * dcr) + (wb * dcb * dcb) + (wa * da * da);
+					float rgb_err = (wr * dl * dl) + (wg * dcr * dcr) + (wb * dcb * dcb);
+					float err = awsq * rgb_err + (wa * da * da);
 					if (err < best_err) { best_err = err; best_sel = j; }
 				}
+    pixel_err[i] = (float)best_err;
 				total_errf += best_err; pResults->m_pSelectors_temp[i] = best_sel;
 			}
 		} else {
 			for (uint32_t i = 0; i < num_pixels; i++) {
+    if (dup_of[i] >= 0) { pResults->m_pSelectors_temp[i] = pResults->m_pSelectors_temp[dup_of[i]]; total_errf += pixel_err[dup_of[i]]; continue; }
 				float r = pPixels[i].m_c[0]; float g = pPixels[i].m_c[1]; float b = pPixels[i].m_c[2];
 				float y = r * .2126f + g * .7152f + b * .0722f; float cr = r - y; float cb = b - y;
 				float best_err = 1e+10f; int32_t best_sel;
@@ -1626,6 +1708,7 @@ static uint64_t evaluate_solution(const color_quad_i *pLow, const color_quad_i *
 					float err = (wr * dl * dl) + (wg * dcr * dcr) + (wb * dcb * dcb);
 					if (err < best_err) { best_err = err; best_sel = j; }
 				}
+    pixel_err[i] = (float)best_err;
 				total_errf += best_err; pResults->m_pSelectors_temp[i] = best_sel;
 			}
 		}
@@ -1781,9 +1864,30 @@ static uint64_t find_optimal_solution( uint32_t mode,  vec4F * pXl,  vec4F * pXh
                                         pbits[1] = best_p1;
                                         evaluate_solution(&lo[best_p0], &hi[best_p1], pbits, pParams, pResults, num_pixels, pPixels);
                                 }
+                                else if (mode == 0)
+                                // ==========================================
+                                // MODE 0 P-BIT PREDICTION VIA QUANTIZATION ERROR LUT
+                                // ==========================================
+                                {
+                                        uint64_t err_lo0 = 0, err_lo1 = 0, err_hi0 = 0, err_hi1 = 0;
+                                        const uint32_t ncomps = pParams->m_has_alpha ? 4 : 3;
+                                        for (uint32_t c = 0; c < ncomps; c++) {
+                                                uint32_t lo_val = (uint32_t)(xl.m_c[c] * 255.0f + 0.5f); if (lo_val > 255) lo_val = 255;
+                                                uint32_t hi_val = (uint32_t)(xh.m_c[c] * 255.0f + 0.5f); if (hi_val > 255) hi_val = 255;
+                                                err_lo0 += g_bc7_mode0_lut[lo_val][0];
+                                                err_lo1 += g_bc7_mode0_lut[lo_val][1];
+                                                err_hi0 += g_bc7_mode0_lut[hi_val][0];
+                                                err_hi1 += g_bc7_mode0_lut[hi_val][1];
+                                        }
+                                        uint32_t best_p0 = (err_lo0 <= err_lo1) ? 0 : 1;
+                                        uint32_t best_p1 = (err_hi0 <= err_hi1) ? 0 : 1;
+                                        pbits[0] = best_p0;
+                                        pbits[1] = best_p1;
+                                        evaluate_solution(&lo[best_p0], &hi[best_p1], pbits, pParams, pResults, num_pixels, pPixels);
+                                }
                                 else
                                 // ==========================================
-                                // ORIGINAL CODE (Non-Mode 6)
+                                // ORIGINAL CODE (Non-Mode 6, Non-Mode 0)
                                 // ==========================================
                                 {
                                     pbits[0] = 0; pbits[1] = 0;
@@ -3733,25 +3837,13 @@ static void handle_alpha_block(void * pBlock, const  color_quad_i * pPixels, con
 	
 	// Mode 6 - MUST REMAIN ACTIVE AS FALLBACK!
 	// The original bimodal alpha fix is restored here to prevent PCA starvation.
-	if (pComp_params->m_alpha_settings.m_use_mode6)
+	if (pComp_params->m_alpha_settings.m_use_mode6 & !bimodal_alpha)
 	{
 		 color_cell_compressor_params params6 = *pParams;
-		if (!bimodal_alpha)
-		{
-			params6.m_weights[0] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[0];
-			params6.m_weights[1] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[1];
-			params6.m_weights[2] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[2];
-			params6.m_weights[3] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[3];
-		}
-		else
-		{
-			// BIMODAL ALPHA FIX: Suppress alpha's PCA influence.
-			// Alpha variance (0 vs 255) dominates PCA, starving RGB and collapsing endpoints.
-			params6.m_weights[0] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[0];
-			params6.m_weights[1] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[1];
-			params6.m_weights[2] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[2];
-			params6.m_weights[3] = 1;  // ← KEY CHANGE: near-zero alpha weight
-		}
+		params6.m_weights[0] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[0];
+		params6.m_weights[1] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[1];
+		params6.m_weights[2] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[2];
+		params6.m_weights[3] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[3];
 		params6.m_pSelector_weights = g_bc7_weights4;
 		params6.m_pSelector_weightsx = (const vec4F *)&g_bc7_weights4x[0];
 		params6.m_num_selector_weights = 16;
@@ -3875,7 +3967,7 @@ static void handle_alpha_block(void * pBlock, const  color_quad_i * pPixels, con
 	}
 
 	// Mode 7 (2-subset, 5-bit RGBA with pbits, 2-bit indices)
-	if (pComp_params->m_alpha_settings.m_use_mode7 && !skip_mode7)
+	if (pComp_params->m_alpha_settings.m_use_mode7 && (!skip_mode7 || bimodal_alpha))
 	{
 		solution solutions[BC7E_MAX_PARTITIONS7];
 		uint32_t num_solutions = estimate_partition_list(7, pPixels, pComp_params, solutions, pComp_params->m_alpha_settings.m_max_mode7_partitions_to_try);
@@ -4002,6 +4094,7 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
 		bc7_optimization_results opt_results;
 				
 		uint64_t best_err = UINT64_MAX;
+		uint64_t best_non_3subset_err = UINT64_MAX;  // Track best non-3-subset error
 
 		// QuickBC7 mode pruning: skip multi-subset modes for simple blocks.
 		// Luma range and distinct color count determine which modes are worth trying.
@@ -4033,6 +4126,7 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
 				results6.m_pSelectors_temp = selectors_temp;
 
 				best_err = color_cell_compression(6, pParams, &results6, pComp_params, 16, pPixels, true);
+				best_non_3subset_err = best_err;
 												
 				opt_results.m_mode = 6;
 				opt_results.m_index_selector = 0;
@@ -4147,6 +4241,7 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
 						if (trial_err < best_err)
 						{
 								best_err = trial_err;
+    							best_non_3subset_err = trial_err;
 
 								opt_results.m_mode = 1;
 								opt_results.m_index_selector = 0;
@@ -4222,6 +4317,7 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
 						if (trial_err < best_err)
 						{
 								best_err = trial_err;
+    							best_non_3subset_err = trial_err;
 
 								for ( uint32_t subset = 0; subset < 2; subset++)
 								{
@@ -4284,82 +4380,123 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
                 pParams->m_endpoints_share_pbit = false;
 
 				pParams->m_perceptual = pComp_params->m_perceptual;
-								
-				for ( uint32_t solution_index = 0; solution_index < num_solutions3; solution_index++)
-				{
-						const uint32_t best_partition0 = solutions3[solution_index].m_index;
 
-						const int *pPartition = &g_bc7_partition3[best_partition0 * 16];
+								// ============================================================
+								// TWO-STAGE PARTITION EVALUATION (Optimization #3)
+								// Stage 1: Quick-scan all candidate partitions with
+								//          refinement=false (1 find_optimal_solution per
+								//          subset). Track the partition with lowest error.
+								// Stage 2: Run full refinement=true only on the winning
+								//          partition from stage 1.
+								// ============================================================
+								uint32_t best_part_idx = 0;
+								uint64_t best_stage1_err = UINT64_MAX;
 
-						color_quad_i subset_colors[3][16];
-												
-						uint32_t subset_total_colors0[3];
-						subset_total_colors0[0] = 0;
-						subset_total_colors0[1] = 0;
-						subset_total_colors0[2] = 0;
-
-						int subset_pixel_index0[3][16];
-												
-						for ( uint32_t idx = 0; idx < 16; idx++)
-						{
-// #pragma ignore warning(perf)  [ISPC pragma, no-op in C++]
-								const uint32_t p = pPartition[idx];
-
-// #pragma ignore warning(perf)  [ISPC pragma, no-op in C++]
-								subset_colors[p][subset_total_colors0[p]] = pPixels[idx];
-// #pragma ignore warning(perf)  [ISPC pragma, no-op in C++]
-								subset_pixel_index0[p][subset_total_colors0[p]] = idx;
-// #pragma ignore warning(perf)  [ISPC pragma, no-op in C++]
-								subset_total_colors0[p]++;
-						}
-																		
-						color_cell_compressor_results subset_results0[3];
-						int subset_selectors0[3][16];                   
-
-						uint64_t mode0_err = 0;
-						for ( uint32_t subset = 0; subset < 3; subset++)
-						{
-								 color_cell_compressor_results * pResults = &subset_results0[subset];
-
-								pResults->m_pSelectors = &subset_selectors0[subset][0];
-								pResults->m_pSelectors_temp = selectors_temp;
-
-								uint64_t err = color_cell_compression(0, pParams, pResults, pComp_params, subset_total_colors0[subset], &subset_colors[subset][0], true);
-								assert(err == pResults->m_best_overall_err);
-
-								mode0_err += err;
-								if (mode0_err > best_err)
-										break;
-						} // subset
-
-						if (mode0_err < best_err)
-						{
-								best_err = mode0_err;
-
-								opt_results.m_mode = 0;
-								opt_results.m_index_selector = 0;
-								opt_results.m_rotation = 0;
-								opt_results.m_partition = best_partition0;
-
-								for ( uint32_t subset = 0; subset < 3; subset++)
+								// ---- Stage 1: quick scan ----
+								for ( uint32_t solution_index = 0; solution_index < num_solutions3; solution_index++)
 								{
-										for ( uint32_t i = 0; i < subset_total_colors0[subset]; i++)
-										{
-												const uint32_t pixel_index = subset_pixel_index0[subset][i];
+										const uint32_t best_partition0 = solutions3[solution_index].m_index;
+										const int *pPartition = &g_bc7_partition3[best_partition0 * 16];
 
-// #pragma ignore warning(perf)  [ISPC pragma, no-op in C++]
-												opt_results.m_selectors[pixel_index] = subset_selectors0[subset][i];
+										color_quad_i subset_colors_s1[3][16];
+										uint32_t subset_total_s1[3] = { 0, 0, 0 };
+
+										for ( uint32_t idx = 0; idx < 16; idx++)
+										{
+												const uint32_t p = pPartition[idx];
+												subset_colors_s1[p][subset_total_s1[p]] = pPixels[idx];
+												subset_total_s1[p]++;
 										}
 
-										opt_results.m_low[subset] = subset_results0[subset].m_low_endpoint;
-										opt_results.m_high[subset] = subset_results0[subset].m_high_endpoint;
+										color_cell_compressor_results stage1_results[3];
+										int stage1_selectors[3][16];
 
-										opt_results.m_pbits[subset][0] = subset_results0[subset].m_pbits[0];
-										opt_results.m_pbits[subset][1] = subset_results0[subset].m_pbits[1];
-								}
+										uint64_t part_err = 0;
+										for ( uint32_t subset = 0; subset < 3; subset++)
+										{
+												color_cell_compressor_results * pResults = &stage1_results[subset];
+												pResults->m_pSelectors = &stage1_selectors[subset][0];
+												pResults->m_pSelectors_temp = selectors_temp;
+
+												uint64_t err = color_cell_compression(0, pParams, pResults, pComp_params, subset_total_s1[subset], &subset_colors_s1[subset][0], false);
+
+												part_err += err;
+												if (part_err > best_stage1_err)
+														break;
+										} // subset
+
+										if (part_err < best_stage1_err)
+										{
+												best_stage1_err = part_err;
+												best_part_idx = solution_index;
+										}
+								} // stage 1
+
+								// ---- Stage 2: full refinement on the winner only ----
+								if (num_solutions3 > 0)
+								{
+										const uint32_t best_partition0 = solutions3[best_part_idx].m_index;
+										const int *pPartition = &g_bc7_partition3[best_partition0 * 16];
+
+										color_quad_i subset_colors[3][16];
+										uint32_t subset_total_colors0[3];
+										subset_total_colors0[0] = 0;
+										subset_total_colors0[1] = 0;
+										subset_total_colors0[2] = 0;
+
+										int subset_pixel_index0[3][16];
+
+										for ( uint32_t idx = 0; idx < 16; idx++)
+										{
+												const uint32_t p = pPartition[idx];
+												subset_colors[p][subset_total_colors0[p]] = pPixels[idx];
+												subset_pixel_index0[p][subset_total_colors0[p]] = idx;
+												subset_total_colors0[p]++;
+										}
+
+										color_cell_compressor_results subset_results0[3];
+										int subset_selectors0[3][16];
+
+										uint64_t mode0_err = 0;
+										for ( uint32_t subset = 0; subset < 3; subset++)
+										{
+												 color_cell_compressor_results * pResults = &subset_results0[subset];
+
+												pResults->m_pSelectors = &subset_selectors0[subset][0];
+												pResults->m_pSelectors_temp = selectors_temp;
+
+												uint64_t err = color_cell_compression(0, pParams, pResults, pComp_params, subset_total_colors0[subset], &subset_colors[subset][0], true);
+												assert(err == pResults->m_best_overall_err);
+
+												mode0_err += err;
+										} // subset
+
+										if (mode0_err < best_err)
+										{
+												best_err = mode0_err;
+
+												opt_results.m_mode = 0;
+												opt_results.m_index_selector = 0;
+												opt_results.m_rotation = 0;
+												opt_results.m_partition = best_partition0;
+
+												for ( uint32_t subset = 0; subset < 3; subset++)
+												{
+														for ( uint32_t i = 0; i < subset_total_colors0[subset]; i++)
+														{
+																const uint32_t pixel_index = subset_pixel_index0[subset][i];
+																opt_results.m_selectors[pixel_index] = subset_selectors0[subset][i];
+														}
+
+													opt_results.m_low[subset] = subset_results0[subset].m_low_endpoint;
+													opt_results.m_high[subset] = subset_results0[subset].m_high_endpoint;
+
+													opt_results.m_pbits[subset][0] = subset_results0[subset].m_pbits[0];
+													opt_results.m_pbits[subset][1] = subset_results0[subset].m_pbits[1];
+												}
+										}
+								} // stage 2
 						}
-				}
-		}
 				
 		// Mode 3 (2-subset, 7+1-bit color with shared pbit, 2-bit indices)
 		if (pComp_params->m_opaque_settings.m_use_mode[0] && !skip_multisubset && try_3_subset)
@@ -4426,6 +4563,7 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
 						if (trial_err < best_err)
 						{
 								best_err = trial_err;
+    							best_non_3subset_err = trial_err;
 																				
 								opt_results.m_mode = 3;
 								opt_results.m_index_selector = 0;
@@ -4504,6 +4642,7 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
 						if (trial_err < best_err)
 						{
 								best_err = trial_err;
+    							best_non_3subset_err = trial_err;
 																				
 								for ( uint32_t subset = 0; subset < 2; subset++)
 								{
@@ -4527,7 +4666,7 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
 
 		// Mode 5 (1-subset, 7-bit color + 8-bit alpha, separate selectors)
 		// Only useful for opaque blocks when using rotation to treat one RGB channel as alpha.
-		if ((!pComp_params->m_perceptual) && pComp_params->m_opaque_settings.m_use_mode[5])
+		if ((!pComp_params->m_perceptual) && (pComp_params->m_opaque_settings.m_use_mode[5]) && !skip_multisubset)
 		{
 				 color_cell_compressor_params params5 = *pParams;
 
@@ -4712,7 +4851,7 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
 
 		// Mode 4 (1-subset, 5-bit RGB + 6-bit alpha, separate selectors, rotation)
 		// For opaque blocks this uses rotation to treat an RGB channel as "alpha".
-		if ((!pComp_params->m_perceptual) && pComp_params->m_opaque_settings.m_use_mode[4])
+		if ((!pComp_params->m_perceptual) && (pComp_params->m_opaque_settings.m_use_mode[4]) && !skip_multisubset)
 		{
 				 color_cell_compressor_params params4 = *pParams;
 
@@ -4755,6 +4894,7 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
 						if (trial_mode4_err < best_err)
 						{
 								best_err = trial_mode4_err;
+    							best_non_3subset_err = trial_mode4_err;
 
 								opt_results.m_mode = 4;
 								opt_results.m_index_selector = trial_opt_results4.m_index_selector;
@@ -4772,7 +4912,33 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
 						}
 				} // rotation
 		}
-		
+
+		if (best_err == UINT64_MAX)
+		{
+			// No mode succeeded - force Mode 6 as fallback
+			pParams->m_pSelector_weights = g_bc7_weights4;
+			pParams->m_pSelector_weightsx = (const vec4F *)&g_bc7_weights4x[0];
+			pParams->m_num_selector_weights = 16;
+			pParams->m_comp_bits = 7;
+			pParams->m_has_pbits = true;
+			pParams->m_endpoints_share_pbit = false;
+			pParams->m_perceptual = pComp_params->m_perceptual;
+			
+			color_cell_compressor_results results6;
+			results6.m_pSelectors = opt_results.m_selectors;
+			results6.m_pSelectors_temp = selectors_temp;
+			best_err = color_cell_compression(6, pParams, &results6, pComp_params, 16, pPixels, true);
+			
+			opt_results.m_mode = 6;
+			opt_results.m_index_selector = 0;
+			opt_results.m_rotation = 0;
+			opt_results.m_partition = 0;
+			opt_results.m_low[0] = results6.m_low_endpoint;
+			opt_results.m_high[0] = results6.m_high_endpoint;
+			opt_results.m_pbits[0][0] = results6.m_pbits[0];
+			opt_results.m_pbits[0][1] = results6.m_pbits[1];
+		}
+
 		encode_bc7_block(pBlock, &opt_results);
 }
 
@@ -4994,26 +5160,17 @@ void bc7e_compress_block_params_init(bc7e_compress_block_params *  p,  bool perc
 		p->m_mode4_index_mask = 3;
 		p->m_mode5_rotation_mask = 0xF;
 		p->m_uber1_mask = 7;
-		for ( uint32_t i = 0; i < 7; i++)
-				p->m_opaque_settings.m_use_mode[i] = true;
 
-		// =====================================================================
-		// 1.4x SPEEDUP TWEAK: Disable heavy 3-subset modes (0 and 2).
-		// They cost ~3x the compression time due to 3 subset evaluations + 
-		// partition search, but rarely win over 2-subset/1-subset modes.
-		// =====================================================================
 		p->m_opaque_settings.m_use_mode[0] = false;
-
-		// =====================================================================
-		// SPEEDUP: Disable Mode 4 & 5 for opaque blocks.
-		// They are alpha-optimized. Using them on opaque blocks requires 
-		// rotating RGB into Alpha, which is a massive search space for 
-		// almost zero gain over Mode 6 or Mode 1/3.
-		// =====================================================================
+		p->m_opaque_settings.m_use_mode[1] = true;
+		p->m_opaque_settings.m_use_mode[2] = true;
+		p->m_opaque_settings.m_use_mode[3] = true;
 		p->m_opaque_settings.m_use_mode[4] = false;
 		p->m_opaque_settings.m_use_mode[5] = false;
+		p->m_opaque_settings.m_use_mode[6] = true;
+		p->m_opaque_settings.m_use_mode[7] = true;
 
-		p->m_opaque_settings.m_max_mode13_partitions_to_try = 1;
+		p->m_opaque_settings.m_max_mode13_partitions_to_try = 2;
 		p->m_opaque_settings.m_max_mode0_partitions_to_try = 1;
 		p->m_opaque_settings.m_max_mode2_partitions_to_try = 1;
 
@@ -5021,9 +5178,7 @@ void bc7e_compress_block_params_init(bc7e_compress_block_params *  p,  bool perc
 		p->m_alpha_settings.m_use_mode5 = true;
 		p->m_alpha_settings.m_use_mode6 = true;
 		p->m_alpha_settings.m_use_mode7 = true;
-		p->m_alpha_settings.m_use_mode4_rotation = true;
-		p->m_alpha_settings.m_use_mode5_rotation = true;
-		p->m_alpha_settings.m_max_mode7_partitions_to_try = 1;
+		p->m_alpha_settings.m_max_mode7_partitions_to_try = 2;
 		p->m_alpha_settings.m_mode67_error_weight_mul[0] = 1;
 		p->m_alpha_settings.m_mode67_error_weight_mul[1] = 1;
 		p->m_alpha_settings.m_mode67_error_weight_mul[2] = 1;
@@ -5252,22 +5407,6 @@ static void bc7e_compress_block_range(
 
 				bc7_block_stats stats;
 				compute_block_stats(&stats, temp_pixels);
-
-				// Bimodal alpha fix
-				if (has_alpha && stats.min_alpha < 32 && stats.max_alpha >= 224)
-				{
-						for (int i = 0; i < 16; i++)
-						{
-								if (temp_pixels[i].m_c[3] < 32)
-								{
-										temp_pixels[i].m_c[0] = 0;
-										temp_pixels[i].m_c[1] = 0;
-										temp_pixels[i].m_c[2] = 0;
-										temp_pixels[i].m_c[3] = 0;
-								}
-						}
-						lo_a = 0.0f;
-				}
 
 				const bool has_alpha_final = (lo_a < 255.0f);
 				const bool bimodal_alpha = (stats.min_alpha < 32 && stats.max_alpha >= 224);
