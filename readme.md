@@ -10,7 +10,7 @@ Now for PSNR comparison...
 
 ![Oop! One pixel difference.](barchart.png)
 
-Yep. Mine's virtually identical, and also (possibly) better quality than others, except it's multitudes faster because I just observed the exact speed of each of the encoders on the list and have done vastly big amounts of other plentiful optimizations, including but not limited to pixel deduplication.
+Yep. Mine's virtually identical, and also (possibly) better quality than others, except it's multitudes faster because I just observed the exact speed of each of the encoders on the list and have done vastly big amounts of other plentiful optimizations.
 
 ---
 

@@ -354,6 +354,33 @@ static const  int g_bc7_table_anchor_index_third_subset_2[64] =
 };
 
 static const  int g_bc7_num_subsets[8] = { 3, 2, 3, 2, 1, 1, 1, 2 };
+// Phase 2: Pre-computed partition subset pixel indices and counts
+static int g_bc7_subset_pixels[64][3][16];
+static int g_bc7_subset_counts[64][3];
+
+static void init_bc7_partition_subsets()
+{
+	for (int p = 0; p < 64; p++)
+	{
+		int counts2[16], counts3[16];
+		for (int i = 0; i < 16; i++)
+		{
+			counts2[i] = g_bc7_partition2[p * 16 + i];
+			counts3[i] = g_bc7_partition3[p * 16 + i];
+		}
+		for (int s = 0; s < 3; s++)
+		{
+			g_bc7_subset_counts[p][s] = 0;
+			for (int i = 0; i < 16; i++)
+			{
+				if (s < 2 && counts2[i] == s)
+					g_bc7_subset_pixels[p][s][g_bc7_subset_counts[p][s]++] = i;
+				if (counts3[i] == s)
+					g_bc7_subset_pixels[p][s][g_bc7_subset_counts[p][s]++] = i;
+			}
+		}
+	}
+}
 static const  int g_bc7_partition_bits[8] = { 4, 6, 6, 6, 0, 0, 0, 6 };
 static const  int g_bc7_rotation_bits[8] = { 0, 0, 0, 0, 2, 2, 0, 0 };
 static const  int g_bc7_color_index_bitcount[8] = { 3, 3, 2, 2, 2, 2, 4, 2 };
@@ -669,6 +696,8 @@ void bc7e_compress_block_init()
 {
 		if (g_codec_initialized)
 				return;
+
+		init_bc7_partition_subsets();
 
 		// Mode 0: 444.1
 		for ( int c = 0; c < 256; c++)
@@ -1458,7 +1487,7 @@ static uint64_t pack_mode7_to_one_color(const  color_cell_compressor_params * pP
 
 static uint64_t evaluate_solution(const color_quad_i *pLow, const color_quad_i *pHigh, const uint32_t *pbits,
 								  const color_cell_compressor_params *pParams, color_cell_compressor_results *pResults, 
-								  uint32_t num_pixels, const color_quad_i *pPixels)
+								  uint32_t num_pixels, const color_quad_i *pPixels, const int *dup_of)
 {
 	color_quad_i quantMinColor = *pLow;
 	color_quad_i quantMaxColor = *pHigh;
@@ -1490,25 +1519,8 @@ static uint64_t evaluate_solution(const color_quad_i *pLow, const color_quad_i *
 		for (uint32_t j = 0; j < nc; j++)
 			weightedColors[i].m_c[j] = floor((weightedColors[0].m_c[j] * (64.0f - pParams->m_pSelector_weights[i]) + weightedColors[N - 1].m_c[j] * pParams->m_pSelector_weights[i] + 32) * (1.0f / 64.0f));
 
-	// =====================================================================
-	// PIXEL DEDUPLICATION CACHE (Optimization #5)
-	// dup_of[i] = j if pixel i is identical to pixel j (j < i), else -1.
-	// Duplicate pixels skip the selector search and reuse cached results.
-	// =====================================================================
-	int dup_of[16];
-	{
-		const uint32_t nc_check = pParams->m_has_alpha ? 4 : 3;
-		for (uint32_t i = 0; i < num_pixels; i++) {
-			dup_of[i] = -1;
-			for (uint32_t j = 0; j < i; j++) {
-				bool same = true;
-				for (uint32_t c = 0; c < nc_check; c++) {
-					if (pPixels[i].m_c[c] != pPixels[j].m_c[c]) { same = false; break; }
-				}
-				if (same) { dup_of[i] = (int)j; break; }
-			}
-		}
-	}
+	// PIXEL DEDUPLICATION CACHE: dup_of[] computed once in color_cell_compression,
+	// passed as const int* parameter. Selector search skips duplicate pixels.
 	float pixel_err[16];
 
 	if (!pParams->m_perceptual)
@@ -1768,7 +1780,7 @@ static void fixDegenerateEndpoints( uint32_t mode,  color_quad_i * pTrialMinColo
 }
 
 static uint64_t find_optimal_solution( uint32_t mode,  vec4F * pXl,  vec4F * pXh, const  color_cell_compressor_params * pParams,  color_cell_compressor_results * pResults, 
-         bool pbit_search, uint32_t num_pixels, const  color_quad_i * pPixels)
+         bool pbit_search, uint32_t num_pixels, const  color_quad_i * pPixels, const int *pDupOf)
 {
         vec4F xl = *pXl;
         vec4F xh = *pXh;
@@ -1854,7 +1866,7 @@ static uint64_t find_optimal_solution( uint32_t mode,  vec4F * pXl,  vec4F * pXh
                                         
                                         pbits[0] = best_p0;
                                         pbits[1] = best_p1;
-                                        evaluate_solution(&lo[best_p0], &hi[best_p1], pbits, pParams, pResults, num_pixels, pPixels);
+                                        evaluate_solution(&lo[best_p0], &hi[best_p1], pbits, pParams, pResults, num_pixels, pPixels, pDupOf);
                                 }
                                 else if (mode == 0)
                                 // ==========================================
@@ -1875,7 +1887,7 @@ static uint64_t find_optimal_solution( uint32_t mode,  vec4F * pXl,  vec4F * pXh
                                         uint32_t best_p1 = (err_hi0 <= err_hi1) ? 0 : 1;
                                         pbits[0] = best_p0;
                                         pbits[1] = best_p1;
-                                        evaluate_solution(&lo[best_p0], &hi[best_p1], pbits, pParams, pResults, num_pixels, pPixels);
+                                        evaluate_solution(&lo[best_p0], &hi[best_p1], pbits, pParams, pResults, num_pixels, pPixels, pDupOf);
                                 }
                                 else
                                 // ==========================================
@@ -1883,16 +1895,16 @@ static uint64_t find_optimal_solution( uint32_t mode,  vec4F * pXl,  vec4F * pXh
                                 // ==========================================
                                 {
                                     pbits[0] = 0; pbits[1] = 0;
-                                    evaluate_solution(&lo[0], &hi[0], pbits, pParams, pResults, num_pixels, pPixels);
+                                    evaluate_solution(&lo[0], &hi[0], pbits, pParams, pResults, num_pixels, pPixels, pDupOf);
 
                                     pbits[0] = 0; pbits[1] = 1;
-                                    evaluate_solution(&lo[0], &hi[1], pbits, pParams, pResults, num_pixels, pPixels);
+                                    evaluate_solution(&lo[0], &hi[1], pbits, pParams, pResults, num_pixels, pPixels, pDupOf);
 
                                     pbits[0] = 1; pbits[1] = 0;
-                                    evaluate_solution(&lo[1], &hi[0], pbits, pParams, pResults, num_pixels, pPixels);
+                                    evaluate_solution(&lo[1], &hi[0], pbits, pParams, pResults, num_pixels, pPixels, pDupOf);
                                     
                                     pbits[0] = 1; pbits[1] = 1;
-                                    evaluate_solution(&lo[1], &hi[1], pbits, pParams, pResults, num_pixels, pPixels);
+                                    evaluate_solution(&lo[1], &hi[1], pbits, pParams, pResults, num_pixels, pPixels, pDupOf);
                                 }
                         }
                         else
@@ -1951,7 +1963,7 @@ static uint64_t find_optimal_solution( uint32_t mode,  vec4F * pXl,  vec4F * pXh
                                         
                                         pbits[0] = best_p;
                                         pbits[1] = best_p;
-                                        evaluate_solution(&lo[best_p], &hi[best_p], pbits, pParams, pResults, num_pixels, pPixels);
+                                        evaluate_solution(&lo[best_p], &hi[best_p], pbits, pParams, pResults, num_pixels, pPixels, pDupOf);
                                 }
                                 else
                                 // ==========================================
@@ -1959,10 +1971,10 @@ static uint64_t find_optimal_solution( uint32_t mode,  vec4F * pXl,  vec4F * pXh
                                 // ==========================================
                                 {
                                     pbits[0] = 0; pbits[1] = 0;
-                                    evaluate_solution(&lo[0], &hi[0], pbits, pParams, pResults, num_pixels, pPixels);
+                                    evaluate_solution(&lo[0], &hi[0], pbits, pParams, pResults, num_pixels, pPixels, pDupOf);
 
                                     pbits[0] = 1; pbits[1] = 1;
-                                    evaluate_solution(&lo[1], &hi[1], pbits, pParams, pResults, num_pixels, pPixels);
+                                    evaluate_solution(&lo[1], &hi[1], pbits, pParams, pResults, num_pixels, pPixels, pDupOf);
                                 }
                         }
                 }
@@ -2082,7 +2094,7 @@ static uint64_t find_optimal_solution( uint32_t mode,  vec4F * pXl,  vec4F * pXh
 
                         if ((pResults->m_best_overall_err == UINT64_MAX) || color_quad_i_notequals(&bestMinColor, &pResults->m_low_endpoint) || color_quad_i_notequals(&bestMaxColor, &pResults->m_high_endpoint) || (best_pbits[0] != pResults->m_pbits[0]) || (best_pbits[1] != pResults->m_pbits[1]))
                         {
-                                evaluate_solution(&bestMinColor, &bestMaxColor, best_pbits, pParams, pResults, num_pixels, pPixels);
+                                evaluate_solution(&bestMinColor, &bestMaxColor, best_pbits, pParams, pResults, num_pixels, pPixels, pDupOf);
                         }
                 }
         }
@@ -2103,7 +2115,7 @@ static uint64_t find_optimal_solution( uint32_t mode,  vec4F * pXl,  vec4F * pXh
                         pbits[0] = 0;
                         pbits[1] = 0;
 
-                        evaluate_solution(&trialMinColor, &trialMaxColor, pbits, pParams, pResults, num_pixels, pPixels);
+                        evaluate_solution(&trialMinColor, &trialMaxColor, pbits, pParams, pResults, num_pixels, pPixels, pDupOf);
                 }
         }
 
@@ -2153,6 +2165,23 @@ static uint64_t color_cell_compression( uint32_t mode, const  color_cell_compres
 				}
 		}
 
+
+		// PIXEL DEDUPLICATION CACHE (hoisted from evaluate_solution)
+		// Computed once per subset, reused across all find_optimal_solution calls.
+		int dup_of_cc[16];
+		{
+			const uint32_t nc_dup = pParams->m_has_alpha ? 4 : 3;
+			for (uint32_t i = 0; i < num_pixels; i++) {
+				dup_of_cc[i] = -1;
+				for (uint32_t j = 0; j < i; j++) {
+					bool same = true;
+					for (uint32_t c = 0; c < nc_dup; c++) {
+						if (pPixels[i].m_c[c] != pPixels[j].m_c[c]) { same = false; break; }
+					}
+					if (same) { dup_of_cc[i] = (int)j; break; }
+				}
+			}
+		}
 		vec4F meanColor, axis;
 		vec4F_set_scalar(&meanColor, 0.0f);
 
@@ -2303,7 +2332,7 @@ static uint64_t color_cell_compression( uint32_t mode, const  color_cell_compres
 				maxColor = temp;
 		}
 
-		if (!find_optimal_solution(mode, &minColor, &maxColor, pParams, pResults, pComp_params->m_pbit_search, num_pixels, pPixels))
+		if (!find_optimal_solution(mode, &minColor, &maxColor, pParams, pResults, pComp_params->m_pbit_search, num_pixels, pPixels, dup_of_cc))
 				return 0;
 
 		// SKIP REFINEMENT IF ALREADY PERFECT OR NEAR-PERFECT
@@ -2336,7 +2365,7 @@ static uint64_t color_cell_compression( uint32_t mode, const  color_cell_compres
 				xl = vec4F_mul(&xl, (1.0f / 255.0f));
 				xh = vec4F_mul(&xh, (1.0f / 255.0f));
 
-				if (!find_optimal_solution(mode, &xl, &xh, pParams, pResults, pComp_params->m_pbit_search, num_pixels, pPixels))
+				if (!find_optimal_solution(mode, &xl, &xh, pParams, pResults, pComp_params->m_pbit_search, num_pixels, pPixels, dup_of_cc))
 						return 0;
 		}
 
@@ -2383,7 +2412,7 @@ static uint64_t color_cell_compression( uint32_t mode, const  color_cell_compres
 						xl = vec4F_mul(&xl, (1.0f / 255.0f));
 						xh = vec4F_mul(&xh, (1.0f / 255.0f));
 
-						if (!find_optimal_solution(mode, &xl, &xh, pParams, pResults, pComp_params->m_pbit_search, num_pixels, pPixels))
+						if (!find_optimal_solution(mode, &xl, &xh, pParams, pResults, pComp_params->m_pbit_search, num_pixels, pPixels, dup_of_cc))
 								return 0;
 				}
 
@@ -2409,7 +2438,7 @@ static uint64_t color_cell_compression( uint32_t mode, const  color_cell_compres
 						xl = vec4F_mul(&xl, (1.0f / 255.0f));
 						xh = vec4F_mul(&xh, (1.0f / 255.0f));
 
-						if (!find_optimal_solution(mode, &xl, &xh, pParams, pResults, pComp_params->m_pbit_search, num_pixels, pPixels))
+						if (!find_optimal_solution(mode, &xl, &xh, pParams, pResults, pComp_params->m_pbit_search, num_pixels, pPixels, dup_of_cc))
 								return 0;
 				}
 
@@ -2437,7 +2466,7 @@ static uint64_t color_cell_compression( uint32_t mode, const  color_cell_compres
 						xl = vec4F_mul(&xl, (1.0f / 255.0f));
 						xh = vec4F_mul(&xh, (1.0f / 255.0f));
 
-						if (!find_optimal_solution(mode, &xl, &xh, pParams, pResults, pComp_params->m_pbit_search, num_pixels, pPixels))
+						if (!find_optimal_solution(mode, &xl, &xh, pParams, pResults, pComp_params->m_pbit_search, num_pixels, pPixels, dup_of_cc))
 								return 0;
 				}
 
@@ -2469,7 +2498,7 @@ static uint64_t color_cell_compression( uint32_t mode, const  color_cell_compres
 										xl = vec4F_mul(&xl, (1.0f / 255.0f));
 										xh = vec4F_mul(&xh, (1.0f / 255.0f));
 
-										if (!find_optimal_solution(mode, &xl, &xh, pParams, pResults, pComp_params->m_pbit_search && (pComp_params->m_uber_level >= 2), num_pixels, pPixels))
+										if (!find_optimal_solution(mode, &xl, &xh, pParams, pResults, pComp_params->m_pbit_search && (pComp_params->m_uber_level >= 2), num_pixels, pPixels, dup_of_cc))
 												return 0;
 								}
 						}
@@ -2790,6 +2819,16 @@ struct solution
 		uint64_t m_err;
 };
 
+// Phase 2 candidate
+struct phase2_candidate
+{
+	uint32_t partition;
+	uint64_t score;
+	int cached_min_r[3], cached_max_r[3];
+	int cached_min_g[3], cached_max_g[3];
+	int cached_min_b[3], cached_max_b[3];
+};
+
 static uint32_t estimate_partition_list(uint32_t mode, const color_quad_i * pPixels,
     const bc7e_compress_block_params * pComp_params,
     solution * pSolutions, int32_t max_solutions)
@@ -2905,6 +2944,76 @@ static uint32_t estimate_partition_list(uint32_t mode, const color_quad_i * pPix
     }
 
     // ============================================================
+    // PHASE 2: Compactness + Overlap sort
+    // ============================================================
+    uint32_t num_p2 = num_top;
+    phase2_candidate p2[64];
+
+    for (uint32_t ti = 0; ti < num_top; ti++)
+    {
+        uint32_t p = top[ti].index;
+        int min_r[3] = {255, 255, 255}, max_r[3] = {0, 0, 0};
+        int min_g[3] = {255, 255, 255}, max_g[3] = {0, 0, 0};
+        int min_b[3] = {255, 255, 255}, max_b[3] = {0, 0, 0};
+
+        for (uint32_t s = 0; s < total_subsets; s++)
+        {
+            int cnt = g_bc7_subset_counts[p][s];
+            const int *pix = g_bc7_subset_pixels[p][s];
+            for (int j = 0; j < cnt; j++)
+            {
+                int idx = pix[j];
+                int r = pPixels[idx].m_c[0], g = pPixels[idx].m_c[1], b = pPixels[idx].m_c[2];
+                if (r < min_r[s]) min_r[s] = r; if (r > max_r[s]) max_r[s] = r;
+                if (g < min_g[s]) min_g[s] = g; if (g > max_g[s]) max_g[s] = g;
+                if (b < min_b[s]) min_b[s] = b; if (b > max_b[s]) max_b[s] = b;
+            }
+        }
+
+        uint64_t compactness = 0;
+        for (uint32_t s = 0; s < total_subsets; s++)
+            compactness += (uint32_t)(max_r[s] - min_r[s]) +
+                           (uint32_t)(max_g[s] - min_g[s]) +
+                           (uint32_t)(max_b[s] - min_b[s]);
+
+        uint64_t overlap = 0;
+        for (uint32_t s0 = 0; s0 < total_subsets; s0++)
+        {
+            for (uint32_t s1 = s0 + 1; s1 < total_subsets; s1++)
+            {
+                int or_ = max(0, min(max_r[s0], max_r[s1]) - max(min_r[s0], min_r[s1]));
+                int og = max(0, min(max_g[s0], max_g[s1]) - max(min_g[s0], min_g[s1]));
+                int ob = max(0, min(max_b[s0], max_b[s1]) - max(min_b[s0], min_b[s1]));
+                overlap += (uint32_t)(or_ + og + ob);
+            }
+        }
+
+        p2[ti].partition = p;
+        p2[ti].score = compactness * 2 - overlap;
+        for (uint32_t s = 0; s < total_subsets; s++)
+        {
+            p2[ti].cached_min_r[s] = min_r[s]; p2[ti].cached_max_r[s] = max_r[s];
+            p2[ti].cached_min_g[s] = min_g[s]; p2[ti].cached_max_g[s] = max_g[s];
+            p2[ti].cached_min_b[s] = min_b[s]; p2[ti].cached_max_b[s] = max_b[s];
+        }
+    }
+
+    // Sort by score ascending (best first), partition index tiebreaker
+    for (uint32_t i = 1; i < num_p2; i++)
+    {
+        phase2_candidate tmp = p2[i];
+        uint32_t j = i;
+        while (j > 0 && (p2[j-1].score > tmp.score ||
+               (p2[j-1].score == tmp.score && p2[j-1].partition > tmp.partition)))
+        {
+            p2[j] = p2[j-1];
+            j--;
+        }
+        p2[j] = tmp;
+    }
+
+
+    // ============================================================
     // PASS 2: Expensive estimation only on pre-filtered candidates
     // ============================================================
     color_cell_compressor_params params;
@@ -2928,9 +3037,9 @@ static uint32_t estimate_partition_list(uint32_t mode, const color_quad_i * pPix
 
     int32_t num_solutions = 0;
 
-    for (uint32_t ti = 0; ti < num_top; ti++)
+    for (uint32_t ti = 0; ti < num_p2; ti++)
     {
-        uint32_t partition = top[ti].index;
+        uint32_t partition = p2[ti].partition;
         const int * pPartition = (total_subsets == 3) ?
             &g_bc7_partition3[partition * 16] : &g_bc7_partition2[partition * 16];
 
@@ -2948,18 +3057,23 @@ static uint32_t estimate_partition_list(uint32_t mode, const color_quad_i * pPix
         }
 
         uint64_t total_subset_err = 0;
+        uint64_t worst_err = (num_solutions >= max_solutions) ?
+            pSolutions[max_solutions - 1].m_err : UINT64_MAX;
 
         for (uint32_t subset = 0; subset < total_subsets; subset++)
         {
+            if (total_subset_err >= worst_err) break;
+            uint64_t subset_budget = worst_err - total_subset_err;
             uint64_t err;
             if (mode == 7)
-                err = color_cell_compression_est_mode7(mode, &params, UINT64_MAX,
+                err = color_cell_compression_est_mode7(mode, &params, subset_budget,
                     subset_total_colors[subset], &subset_colors[subset][0]);
             else
-                err = color_cell_compression_est(mode, &params, UINT64_MAX,
+                err = color_cell_compression_est(mode, &params, subset_budget,
                     subset_total_colors[subset], &subset_colors[subset][0]);
 
             total_subset_err += err;
+            if (err >= subset_budget) break;
         } // subset
 
         // Insert into sorted solutions (same as original)
@@ -5498,4 +5612,5 @@ static void bc7e_compress_block_range(
 }
 
 #endif // BC7_ENCODER_BASE_H
+
 
