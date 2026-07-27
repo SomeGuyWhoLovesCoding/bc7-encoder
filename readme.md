@@ -4,7 +4,7 @@ I'm serious, this version actually knows what it's doing and optimizes for any r
 
 It is completely beginner friendly and that's it.
 
-And there's also minimal quality loss too, and even a perceptual mode that's enabled with just inputting "1" as the third argument of the commandlist. My use-case stands, and I will always automate bc7 encoding with the highest quality possible whilst retaining the nice efficiency I get!
+And there's also minimal quality loss too, meaning this is the literal fastest whilst preventing some sort of artitacting that went on compared to DirectXTex too. My use-case stands, and I will always automate bc7 encoding with the highest quality possible whilst retaining the nice efficiency I get!
 
 Now for PSNR comparison...
 

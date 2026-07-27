@@ -5161,7 +5161,7 @@ void bc7e_compress_block_params_init(bc7e_compress_block_params *  p,  bool perc
 		p->m_mode5_rotation_mask = 0xF;
 		p->m_uber1_mask = 7;
 
-		p->m_opaque_settings.m_use_mode[0] = false;
+		p->m_opaque_settings.m_use_mode[0] = true;
 		p->m_opaque_settings.m_use_mode[1] = true;
 		p->m_opaque_settings.m_use_mode[2] = true;
 		p->m_opaque_settings.m_use_mode[3] = true;
@@ -5170,7 +5170,7 @@ void bc7e_compress_block_params_init(bc7e_compress_block_params *  p,  bool perc
 		p->m_opaque_settings.m_use_mode[6] = true;
 		p->m_opaque_settings.m_use_mode[7] = true;
 
-		p->m_opaque_settings.m_max_mode13_partitions_to_try = 2;
+		p->m_opaque_settings.m_max_mode13_partitions_to_try = 1;
 		p->m_opaque_settings.m_max_mode0_partitions_to_try = 1;
 		p->m_opaque_settings.m_max_mode2_partitions_to_try = 1;
 
@@ -5178,7 +5178,9 @@ void bc7e_compress_block_params_init(bc7e_compress_block_params *  p,  bool perc
 		p->m_alpha_settings.m_use_mode5 = true;
 		p->m_alpha_settings.m_use_mode6 = true;
 		p->m_alpha_settings.m_use_mode7 = true;
-		p->m_alpha_settings.m_max_mode7_partitions_to_try = 2;
+		p->m_alpha_settings.m_use_mode4_rotation = true;
+		p->m_alpha_settings.m_use_mode5_rotation = true;
+		p->m_alpha_settings.m_max_mode7_partitions_to_try = 1;
 		p->m_alpha_settings.m_mode67_error_weight_mul[0] = 1;
 		p->m_alpha_settings.m_mode67_error_weight_mul[1] = 1;
 		p->m_alpha_settings.m_mode67_error_weight_mul[2] = 1;
