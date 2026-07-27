@@ -133,10 +133,6 @@ public:
 
     BC7Encoder() = default;
 
-    static const char* get_encoder_path_string() {
-        return "Scalar (Atomic Work Stealing)";
-    }
-
     void encode_image_mt(const uint8_t* rgba, int w, int h, std::vector<uint8_t>& bc7_out) {
         const int BW = 4, BH = 4;
         int bx_count = (w + BW - 1) / BW;
@@ -166,7 +162,6 @@ public:
         // Quality 2 (default/balanced)
         bc7e_compress_block_params params;
         bc7e_compress_block_params_init(&params, false);
-        params.m_pbit_search = false;
         params.m_refinement_passes = 2;
         //params.m_uber_level = 1;   // enables the PCA seed improvement (mode 1/3)
 
@@ -225,10 +220,10 @@ public:
         auto t1 = std::chrono::high_resolution_clock::now();
         double encode_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
-        fprintf(stderr, "Encoded %u blocks in %.1f ms (%.0f blocks/sec, %u threads, %s)\n",
+        fprintf(stderr, "Encoded %u blocks in %.1f ms (%.0f blocks/sec, %u threads)\n",
                 total_blocks, encode_ms,
                 encode_ms > 0 ? (total_blocks / (encode_ms / 1000.0)) : 0.0,
-                num_threads, get_encoder_path_string());
+                num_threads);
 
         bc7_out.resize(total_blocks * 16);
         memcpy(bc7_out.data(), blocks.data(), total_blocks * 16);

@@ -2305,9 +2305,18 @@ static uint64_t color_cell_compression( uint32_t mode, const  color_cell_compres
 
 		if (!find_optimal_solution(mode, &minColor, &maxColor, pParams, pResults, pComp_params->m_pbit_search, num_pixels, pPixels))
 				return 0;
-		
-		if (!refinement)
-				return pResults->m_best_overall_err;
+
+		// SKIP REFINEMENT IF ALREADY PERFECT OR NEAR-PERFECT
+		// If the initial PCA nailed it, don't waste time on refinement.
+		if (!refinement || pResults->m_best_overall_err == 0)
+			return pResults->m_best_overall_err;
+
+		// For very low error blocks, skip expensive uber refinement
+		// (saves the 7 extra find_optimal_solution calls in uber_level > 0)
+		// Threshold: ~0.5 RMSE per pixel is visually lossless
+		const uint64_t cheap_refine_thresh = (uint32_t)((uint32_t)num_pixels * 1);
+		if (pResults->m_best_overall_err <= cheap_refine_thresh)
+			return pResults->m_best_overall_err;
 		
 		for ( uint32_t i = 0; i < pComp_params->m_refinement_passes; i++)
 		{
@@ -2541,6 +2550,10 @@ static uint64_t color_cell_compression_est( uint32_t mode, const  color_cell_com
 						float db = itb - (float)pC->m_c[2];
 
 						total_errf += wr * dr * dr + wg * dg * dg + wb * db * db;
+
+						// ADD THIS:
+						if ((uint64_t)total_errf >= best_err_so_far)
+							return (uint64_t)total_errf;
 				}
 		}
 		else
@@ -2777,147 +2790,212 @@ struct solution
 		uint64_t m_err;
 };
 
-static  uint32_t estimate_partition_list( uint32_t mode, const  color_quad_i * pPixels, const  bc7e_compress_block_params * pComp_params, 
-		 solution * pSolutions,  int32_t max_solutions)
+static uint32_t estimate_partition_list(uint32_t mode, const color_quad_i * pPixels,
+    const bc7e_compress_block_params * pComp_params,
+    solution * pSolutions, int32_t max_solutions)
 {
-		const  int32_t orig_max_solutions = max_solutions;
+    const int32_t orig_max_solutions = max_solutions;
+    const uint32_t total_subsets = g_bc7_num_subsets[mode];
+    uint32_t total_partitions = minimumu(pComp_params->m_max_partitions_mode[mode],
+                                          1U << g_bc7_partition_bits[mode]);
 
-		const  uint32_t total_subsets = g_bc7_num_subsets[mode];
-		 uint32_t total_partitions = minimumu(pComp_params->m_max_partitions_mode[mode], 1U << g_bc7_partition_bits[mode]);
+    if (total_partitions <= 1)
+    {
+        pSolutions[0].m_index = 0;
+        pSolutions[0].m_err = 0;
+        return 1;
+    }
+    else if (max_solutions >= total_partitions)
+    {
+        for (int i = 0; i < (int)total_partitions; i++)
+        {
+            pSolutions[i].m_index = i;
+            pSolutions[i].m_err = i;
+        }
+        return total_partitions;
+    }
 
-		if (total_partitions <= 1)
-		{
-				pSolutions[0].m_index = 0;
-				pSolutions[0].m_err = 0;
-				return 1;
-		}
-		else if (max_solutions >= total_partitions)
-		{
-				for ( int i = 0; i < total_partitions; i++)
-				{
-						pSolutions[i].m_index = i;
-						pSolutions[i].m_err = i;
-				}
-				return total_partitions;
-		}
+    const int32_t HIGH_FREQUENCY_SORTED_PARTITION_THRESHOLD = 4;
+    if (total_subsets == 2)
+    {
+        if (max_solutions < HIGH_FREQUENCY_SORTED_PARTITION_THRESHOLD)
+            max_solutions = HIGH_FREQUENCY_SORTED_PARTITION_THRESHOLD;
+    }
 
-		const  int32_t HIGH_FREQUENCY_SORTED_PARTITION_THRESHOLD = 4;
-		if (total_subsets == 2)
-		{
-				if (max_solutions < HIGH_FREQUENCY_SORTED_PARTITION_THRESHOLD)
-						max_solutions = HIGH_FREQUENCY_SORTED_PARTITION_THRESHOLD;
-		}
-												
-		 color_cell_compressor_params params;
-		color_cell_compressor_params_clear(&params);
+    // ============================================================
+    // PASS 1: Cheap volume heuristic pre-filter
+    // Reduce 64 partitions to ~8-12 candidates using min/max only.
+    // No floating-point, no PCA. ~10x faster than est().
+    // ============================================================
+    const uint32_t PREFILTER_K = max_solutions * 4 + 4;
+    const uint32_t PREFILTER_MAX = (PREFILTER_K > total_partitions) ? total_partitions : PREFILTER_K;
 
-		params.m_pSelector_weights = (g_bc7_color_index_bitcount[mode] == 2) ? g_bc7_weights2 : g_bc7_weights3;
-		params.m_num_selector_weights = 1 << g_bc7_color_index_bitcount[mode];
+    // Stage 1: compute volume scores for all partitions
+    uint64_t vol_scores[64];
+    for (uint32_t p = 0; p < total_partitions; p++)
+    {
+        const int *part = (total_subsets == 3) ?
+            &g_bc7_partition3[p * 16] : &g_bc7_partition2[p * 16];
 
-		memcpy(params.m_weights, pComp_params->m_weights, sizeof(params.m_weights));
+        int min_r[3] = {255, 255, 255}, max_r[3] = {0, 0, 0};
+        int min_g[3] = {255, 255, 255}, max_g[3] = {0, 0, 0};
+        int min_b[3] = {255, 255, 255}, max_b[3] = {0, 0, 0};
+        int counts[3] = {0, 0, 0};
 
-		if (mode >= 6)
-		{
-				params.m_weights[0] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[0];
-				params.m_weights[1] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[1];
-				params.m_weights[2] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[2];
-				params.m_weights[3] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[3];
-		}
+        for (int i = 0; i < 16; i++)
+        {
+            int s = part[i];
+            int r = pPixels[i].m_c[0], g = pPixels[i].m_c[1], b = pPixels[i].m_c[2];
+            counts[s]++;
+            if (r < min_r[s]) min_r[s] = r; if (r > max_r[s]) max_r[s] = r;
+            if (g < min_g[s]) min_g[s] = g; if (g > max_g[s]) max_g[s] = g;
+            if (b < min_b[s]) min_b[s] = b; if (b > max_b[s]) max_b[s] = b;
+        }
 
-		params.m_perceptual = pComp_params->m_perceptual;
+        // Skip partitions with empty subsets
+        bool skip = false;
+        for (uint32_t s = 0; s < total_subsets; s++)
+            if (counts[s] == 0) { skip = true; break; }
 
-		 int32_t num_solutions = 0;
+        if (skip) { vol_scores[p] = UINT64_MAX; continue; }
 
-		for ( uint32_t partition = 0; partition < total_partitions; partition++)
-		{
-				const int * pPartition = (total_subsets == 3) ? &g_bc7_partition3[partition * 16] : &g_bc7_partition2[partition * 16];
+        uint64_t vol = 0;
+        for (uint32_t s = 0; s < total_subsets; s++)
+            vol += (uint32_t)(max_r[s] - min_r[s]) +
+                   (uint32_t)(max_g[s] - min_g[s]) +
+                   (uint32_t)(max_b[s] - min_b[s]);
 
-				 color_quad_i subset_colors[3][16];
-				 uint32_t subset_total_colors[3];
-				subset_total_colors[0] = 0;
-				subset_total_colors[1] = 0;
-				subset_total_colors[2] = 0;
+        vol_scores[p] = vol;
+    }
 
-				for ( uint32_t index = 0; index < 16; index++)
-				{
-						const  uint32_t p = pPartition[index];
+    // Stage 2: extract top PREFILTER_MAX candidates by volume score
+    // Simple insertion sort into a small array
+    struct { uint32_t index; uint64_t score; } top[64];
+    uint32_t num_top = 0;
+    for (uint32_t p = 0; p < total_partitions; p++)
+    {
+        if (vol_scores[p] == UINT64_MAX) continue;
+        if (num_top < PREFILTER_MAX)
+        {
+            // Insert in sorted position
+            int pos = (int)num_top;
+            for (int j = 0; j < (int)num_top; j++)
+            {
+                if (vol_scores[p] < top[j].score) { pos = j; break; }
+            }
+            for (int j = (int)num_top; j > pos; j--)
+                top[j] = top[j - 1];
+            top[pos].index = p;
+            top[pos].score = vol_scores[p];
+            num_top++;
+        }
+        else if (vol_scores[p] < top[PREFILTER_MAX - 1].score)
+        {
+            // Replace worst entry
+            int pos = (int)PREFILTER_MAX;
+            for (int j = 0; j < (int)PREFILTER_MAX; j++)
+            {
+                if (vol_scores[p] < top[j].score) { pos = j; break; }
+            }
+            for (int j = PREFILTER_MAX - 1; j > pos; j--)
+                top[j] = top[j - 1];
+            top[pos].index = p;
+            top[pos].score = vol_scores[p];
+        }
+    }
 
-						subset_colors[p][subset_total_colors[p]] = pPixels[index];
-						subset_total_colors[p]++;
-				}
-								
-				uint64_t total_subset_err = 0;
+    // ============================================================
+    // PASS 2: Expensive estimation only on pre-filtered candidates
+    // ============================================================
+    color_cell_compressor_params params;
+    color_cell_compressor_params_clear(&params);
 
-				for ( uint32_t subset = 0; subset < total_subsets; subset++)
-				{
-						uint64_t err;
-						if (mode == 7)
-								err = color_cell_compression_est_mode7(mode, &params, UINT64_MAX, subset_total_colors[subset], &subset_colors[subset][0]);
-						else
-								err = color_cell_compression_est(mode, &params, UINT64_MAX, subset_total_colors[subset], &subset_colors[subset][0]);
+    params.m_pSelector_weights = (g_bc7_color_index_bitcount[mode] == 2) ?
+        g_bc7_weights2 : g_bc7_weights3;
+    params.m_num_selector_weights = 1 << g_bc7_color_index_bitcount[mode];
 
-						total_subset_err += err;
+    memcpy(params.m_weights, pComp_params->m_weights, sizeof(params.m_weights));
 
-				} // subset
+    if (mode >= 6)
+    {
+        params.m_weights[0] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[0];
+        params.m_weights[1] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[1];
+        params.m_weights[2] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[2];
+        params.m_weights[3] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[3];
+    }
 
-				int32_t i;
-				for (i = 0; i < num_solutions; i++)
-				{
-// #pragma ignore warning(perf)  [ISPC pragma, no-op in C++]
-						if (total_subset_err < pSolutions[i].m_err)
-								break;
-				}
-												
-				if (i < num_solutions)
-				{
-						int32_t solutions_to_move = (max_solutions - 1) - i;
-						int32_t num_elements_at_i = num_solutions - i;
-						if (solutions_to_move > num_elements_at_i)
-								solutions_to_move = num_elements_at_i;
-																																
-						assert(((i + 1) + solutions_to_move) <= max_solutions);
-						assert((i + solutions_to_move) <= num_solutions);
-						
-						for (int32_t j = solutions_to_move - 1; j >= 0; --j)
-						{
-// #pragma ignore warning(perf)  [ISPC pragma, no-op in C++]
-								pSolutions[i + j + 1] = pSolutions[i + j];
-						}
-				}
+    params.m_perceptual = pComp_params->m_perceptual;
 
-				if (num_solutions < max_solutions)
-						num_solutions++;
+    int32_t num_solutions = 0;
 
-				if (i < num_solutions)
-				{
-// #pragma ignore warning(perf)  [ISPC pragma, no-op in C++]
-						pSolutions[i].m_err = total_subset_err;
+    for (uint32_t ti = 0; ti < num_top; ti++)
+    {
+        uint32_t partition = top[ti].index;
+        const int * pPartition = (total_subsets == 3) ?
+            &g_bc7_partition3[partition * 16] : &g_bc7_partition2[partition * 16];
 
-// #pragma ignore warning(perf)  [ISPC pragma, no-op in C++]
-						pSolutions[i].m_index = partition;
-				}
+        color_quad_i subset_colors[3][16];
+        uint32_t subset_total_colors[3];
+        subset_total_colors[0] = 0;
+        subset_total_colors[1] = 0;
+        subset_total_colors[2] = 0;
 
-				if ((total_subsets == 2) && (partition == BC7E_2SUBSET_CHECKERBOARD_PARTITION_INDEX))
-				{
-						if ((i >= HIGH_FREQUENCY_SORTED_PARTITION_THRESHOLD))
-								break;
-				}
+        for (uint32_t index = 0; index < 16; index++)
+        {
+            const uint32_t p = pPartition[index];
+            subset_colors[p][subset_total_colors[p]] = pPixels[index];
+            subset_total_colors[p]++;
+        }
 
-		} // partition
+        uint64_t total_subset_err = 0;
 
-#if 0
-		for ( int i = 0; i < num_solutions; i++)
-		{
-				assert(pSolutions[i].m_index < total_partitions);
-		}
+        for (uint32_t subset = 0; subset < total_subsets; subset++)
+        {
+            uint64_t err;
+            if (mode == 7)
+                err = color_cell_compression_est_mode7(mode, &params, UINT64_MAX,
+                    subset_total_colors[subset], &subset_colors[subset][0]);
+            else
+                err = color_cell_compression_est(mode, &params, UINT64_MAX,
+                    subset_total_colors[subset], &subset_colors[subset][0]);
 
-		for ( int i = 0; i < (num_solutions - 1); i++)
-		{
-				assert(pSolutions[i].m_err <= pSolutions[i + 1].m_err);
-		}
-#endif
+            total_subset_err += err;
+        } // subset
 
-		return min(num_solutions, orig_max_solutions);
+        // Insert into sorted solutions (same as original)
+        int32_t i;
+        for (i = 0; i < num_solutions; i++)
+        {
+            if (total_subset_err < pSolutions[i].m_err)
+                break;
+        }
+
+        if (i < num_solutions)
+        {
+            int32_t solutions_to_move = (max_solutions - 1) - i;
+            int32_t num_elements_at_i = num_solutions - i;
+            if (solutions_to_move > num_elements_at_i)
+                solutions_to_move = num_elements_at_i;
+
+            assert(((i + 1) + solutions_to_move) <= max_solutions);
+            assert((i + solutions_to_move) <= num_solutions);
+
+            for (int32_t j = solutions_to_move - 1; j >= 0; --j)
+                pSolutions[i + j + 1] = pSolutions[i + j];
+        }
+
+        if (num_solutions < max_solutions)
+            num_solutions++;
+
+        if (i < num_solutions)
+        {
+            pSolutions[i].m_err = total_subset_err;
+            pSolutions[i].m_index = partition;
+        }
+
+    } // ti (pre-filtered candidates only)
+
+    return min(num_solutions, orig_max_solutions);
 }
 
 static inline void set_block_bits(uint8_t *pBytes, uint32_t val, uint32_t num_bits,  uint32_t * pCur_ofs)
@@ -3765,36 +3843,6 @@ static void handle_alpha_block(void * pBlock, const  color_quad_i * pPixels, con
 		if (g < lo_g) lo_g = g; if (g > hi_g) hi_g = g;
 		if (b < lo_b) lo_b = b; if (b > hi_b) hi_b = b;
 	}
-
-	/*color_quad_i clean_pixels[16];
-	const color_quad_i * pEncPixels = pPixels;
-	if (lo_a == 0 && hi_a > 0)
-	{
-		float sr = 0, sg = 0, sb = 0;
-		int vc = 0;
-		for (int i = 0; i < 16; i++) {
-			if (pPixels[i].m_c[3] > 16) {
-				sr += pPixels[i].m_c[0];
-				sg += pPixels[i].m_c[1];
-				sb += pPixels[i].m_c[2];
-				vc++;
-			}
-		}
-		if (vc > 0 && vc < 16) {
-			memcpy(clean_pixels, pPixels, sizeof(clean_pixels));
-			int ar = (int)(sr / vc + 0.5f);
-			int ag = (int)(sg / vc + 0.5f);
-			int ab = (int)(sb / vc + 0.5f);
-			for (int i = 0; i < 16; i++) {
-				if (clean_pixels[i].m_c[3] <= 16) {
-					clean_pixels[i].m_c[0] = ar;
-					clean_pixels[i].m_c[1] = ag;
-					clean_pixels[i].m_c[2] = ab;
-				}
-			}
-			pEncPixels = clean_pixels;
-		}
-	}*/
 
 	// QuickBC7 alpha mode pruning
 	const int alpha_range = (int)(hi_a - lo_a);
@@ -5172,9 +5220,9 @@ void bc7e_compress_block_params_init(bc7e_compress_block_params *  p,  bool perc
 		}
 		else
 		{
-				p->m_weights[0] = 2;
-				p->m_weights[1] = 2;
-				p->m_weights[2] = 2;
+				p->m_weights[0] = 1;
+				p->m_weights[1] = 1;
+				p->m_weights[2] = 1;
 				p->m_weights[3] = 1;
 		}
 
@@ -5195,7 +5243,7 @@ void bc7e_compress_block_params_init(bc7e_compress_block_params *  p,  bool perc
 		p->m_opaque_settings.m_use_mode[6] = true;
 		p->m_opaque_settings.m_use_mode[7] = true;
 
-		p->m_opaque_settings.m_max_mode13_partitions_to_try = 1;
+		p->m_opaque_settings.m_max_mode13_partitions_to_try = 2;
 		p->m_opaque_settings.m_max_mode0_partitions_to_try = 1;
 		p->m_opaque_settings.m_max_mode2_partitions_to_try = 1;
 
@@ -5206,9 +5254,9 @@ void bc7e_compress_block_params_init(bc7e_compress_block_params *  p,  bool perc
 		p->m_alpha_settings.m_use_mode4_rotation = true;
 		p->m_alpha_settings.m_use_mode5_rotation = true;
 		p->m_alpha_settings.m_max_mode7_partitions_to_try = 2;
-		p->m_alpha_settings.m_mode67_error_weight_mul[0] = 2;
-		p->m_alpha_settings.m_mode67_error_weight_mul[1] = 2;
-		p->m_alpha_settings.m_mode67_error_weight_mul[2] = 2;
+		p->m_alpha_settings.m_mode67_error_weight_mul[0] = 1;
+		p->m_alpha_settings.m_mode67_error_weight_mul[1] = 1;
+		p->m_alpha_settings.m_mode67_error_weight_mul[2] = 1;
 		p->m_alpha_settings.m_mode67_error_weight_mul[3] = 1;
 		p->m_uber_level = 0;
 
