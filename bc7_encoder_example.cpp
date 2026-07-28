@@ -333,7 +333,7 @@ int main(int argc, char* argv[])
 
     // ── Mode Visualization ──
     // Generates a PPM image where each 4x4 block is colored by its chosen BC7 mode.
-    std::string mode_vis_path = out_path;
+    /*std::string mode_vis_path = out_path;
     size_t dot_pos = mode_vis_path.find_last_of('.');
     if (dot_pos != std::string::npos) {
         mode_vis_path = mode_vis_path.substr(0, dot_pos) + "_modes.ppm";
@@ -343,7 +343,7 @@ int main(int argc, char* argv[])
     generate_mode_visualization(mode_vis_path.c_str(), bc7.data(), w, h);
 
     // ── Quality Metrics (matches bc7enc output format) ──
-    compute_and_print_all_metrics(pixels, bc7.data(), bc7.size(), w, h);
+    compute_and_print_all_metrics(pixels, bc7.data(), bc7.size(), w, h);*/
 
     stbi_image_free(pixels);
     return 0;
