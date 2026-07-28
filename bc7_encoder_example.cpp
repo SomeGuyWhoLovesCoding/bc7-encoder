@@ -162,7 +162,7 @@ public:
         // Quality 2 (default/balanced)
         bc7e_compress_block_params params;
         bc7e_compress_block_params_init(&params, false);
-        params.m_refinement_passes = 2;
+        //params.m_refinement_passes = 2;
         //params.m_uber_level = 1;   // enables the PCA seed improvement (mode 1/3)
 
         // bc7e_compress_block_init() initializes the codec's lookup tables
@@ -340,10 +340,10 @@ int main(int argc, char* argv[])
     } else {
         mode_vis_path += "_modes.ppm";
     }
-    generate_mode_visualization(mode_vis_path.c_str(), bc7.data(), w, h);
+    generate_mode_visualization(mode_vis_path.c_str(), bc7.data(), w, h);*/
 
     // ── Quality Metrics (matches bc7enc output format) ──
-    compute_and_print_all_metrics(pixels, bc7.data(), bc7.size(), w, h);*/
+    compute_and_print_all_metrics(pixels, bc7.data(), bc7.size(), w, h);
 
     stbi_image_free(pixels);
     return 0;
