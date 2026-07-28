@@ -87,16 +87,38 @@ struct bc7e_compress_block_params
 
                 uint32_t m_uber_level;
                 uint32_t m_refinement_passes;
-                
+
                 uint32_t m_mode4_rotation_mask;
                 uint32_t m_mode4_index_mask;
                 uint32_t m_mode5_rotation_mask;
                 uint32_t m_uber1_mask;
-                
+
                 bool m_perceptual;
                 bool m_pbit_search;
                 bool m_mode6_only;
                 bool m_unused0;
+
+                // OPTION G: partition DC penalty weight.
+                // When > 0, partition candidates are penalized by
+                //   |mean_g_subset0 - mean_g_subset1| * weight
+                // (plus |mean_r_sub0 - mean_r_sub1| and |mean_b_sub0 - mean_b_sub1|
+                // similarly, each scaled by weight) during partition estimation.
+                // This makes the encoder prefer partitions where the subsets have
+                // similar DC levels, eliminating the "green brightening/darkening
+                // blob" artifact that appears when a partition boundary cuts a
+                // smooth region and the two subsets' endpoints interpolate to
+                // slightly different DC levels.
+                //
+                // Reasonable range: 0.0 (disabled, default) to ~8.0 (strong).
+                // Sweet spot is typically around 1.0-3.0 — small enough that
+                // partitions with truly different content (which NEED separate
+                // subsets) still win, but large enough to break ties in favor
+                // of DC-balanced partitions.
+                //
+                // Affects: estimate_partition_list() for modes 1, 2, 3, 7
+                // (any multi-subset mode). Single-subset modes (4, 5, 6) are
+                // unaffected (they have no partition).
+                float m_partition_dc_penalty_weight;
                 
                 struct
                 {
@@ -2746,11 +2768,20 @@ static uint64_t color_cell_compression( uint32_t mode, const  color_cell_compres
                 // step 2) have at most ±1 endpoint bias — below the 1.5 threshold.
                 // Mode 1's high bias comes from SELECTOR errors (not endpoints), which
                 // GC3 cannot fix.
-                if (pResults->m_best_overall_err != UINT64_MAX &&
-                    pParams->m_comp_bits <= 5 &&
-                    pParams->m_has_pbits &&
-                    !pParams->m_perceptual)
+                //
+                // NOTE: GC3 now runs in BOTH perceptual and non-perceptual modes.
+                // Previously gated to !m_perceptual, which meant it never ran in
+                // the default (perceptual) mode — leaving Mode 7's +0.061 avg bias
+                // and Mode 2's +0.083 avg bias uncorrected. Both modes contribute
+                // to the "green patches" visible in low-green (purple) regions.
+                if (pResults->m_best_overall_err != UINT64_MAX)
                 {
+                        const uint32_t n = pParams->m_comp_bits + (pParams->m_has_pbits ? 1u : 0u);
+                        // Only run for modes with step >= 2 and step <= 4 (n in [6,7]).
+                        // n=5 (Mode 0/2/4, step 8) excluded — shift too coarse, causes overshoot.
+                        // n=8 (Mode 3/6, step 1) excluded — no endpoint quantization bias.
+                        if (n >= 6 && n <= 7)
+                        {
                         // Decode current green endpoints to 6-bit (full value including pbit)
                         color_quad_i qLow = pResults->m_low_endpoint;
                         color_quad_i qHigh = pResults->m_high_endpoint;
@@ -2771,10 +2802,10 @@ static uint64_t color_cell_compression( uint32_t mode, const  color_cell_compres
                                 high_6bit = qHigh.m_c[1];
                         }
 
-                        // Scale to 8-bit: n=6 for both comp_bits=5+pbit and comp_bits=6-no-pbit
-                        // scale_color formula: v = c << (8-n); v |= v >> n. For n=6: v = c<<2 | c>>4
-                        uint32_t aLowG = (low_6bit << 2) | (low_6bit >> 4);
-                        uint32_t aHighG = (high_6bit << 2) | (high_6bit >> 4);
+                        // Scale n-bit to 8-bit: v = c << (8-n); v |= v >> n
+                        const uint32_t gc3_shift_left = 8 - n;
+                        uint32_t aLowG = (low_6bit << gc3_shift_left) | (low_6bit >> n);
+                        uint32_t aHighG = (high_6bit << gc3_shift_left) | (high_6bit >> n);
 
                         // Compute decoded green DC and input green DC
                         int decoded_g_sum = 0, input_g_sum = 0;
@@ -2791,7 +2822,7 @@ static uint64_t color_cell_compression( uint32_t mode, const  color_cell_compres
                         if (bias > 1.5f || bias < -1.5f)
                         {
                                 int shift_dir = (bias > 0) ? -1 : 1;
-                                const int max_6bit = 63;  // 6-bit max
+                                const int max_6bit = (1 << n) - 1;  // n-bit max
 
                                 int new_low_6bit = (int)low_6bit + shift_dir;
                                 int new_high_6bit = (int)high_6bit + shift_dir;
@@ -2844,8 +2875,8 @@ static uint64_t color_cell_compression( uint32_t mode, const  color_cell_compres
 
                                                 // Bias-aware acceptance: compute new bias and accept if
                                                 // bias reduction justifies error increase.
-                                                uint32_t naLowG = (new_low_6bit << 2) | (new_low_6bit >> 4);
-                                                uint32_t naHighG = (new_high_6bit << 2) | (new_high_6bit >> 4);
+                                                uint32_t naLowG = (new_low_6bit << gc3_shift_left) | (new_low_6bit >> n);
+                                                uint32_t naHighG = (new_high_6bit << gc3_shift_left) | (new_high_6bit >> n);
                                                 int new_decoded_g_sum = 0;
                                                 for (uint32_t i = 0; i < num_pixels; i++)
                                                 {
@@ -2858,7 +2889,13 @@ static uint64_t color_cell_compression( uint32_t mode, const  color_cell_compres
                                                 float bias_reduction = (float)fabs(bias) - (float)fabs(new_bias);
                                                 float bias_benefit = bias_reduction * bias_reduction * (float)num_pixels * 2.0f;
                                                 int64_t err_increase = (int64_t)new_err - (int64_t)saved_err;
-                                                bool accept = (err_increase <= 0) || (bias_benefit > (float)err_increase);
+                                                // FIX: Only accept if bias actually reduced (bias_reduction > 0).
+                                                // Previously, bias_benefit = bias_reduction^2 * N * 2 was always
+                                                // positive, so shifts that INCREASED |bias| (negative bias_reduction)
+                                                // could be accepted if err_increase was small. This was rarely
+                                                // triggered for Mode 7 (step 4) but causes regressions for Mode 2
+                                                // (step 8) where overshooting is common.
+                                                bool accept = (err_increase <= 0) || (bias_reduction > 0.0f && bias_benefit > (float)err_increase);
 
                                                 if (!accept)
                                                 {
@@ -2871,7 +2908,8 @@ static uint64_t color_cell_compression( uint32_t mode, const  color_cell_compres
                                                 }
                                         }
                                 }
-                        }
+                        }  // end if (bias > 1.5)
+                        }  // end if (n >= 5 && n <= 7)
                 }
 
                 return pResults->m_best_overall_err;
@@ -3488,6 +3526,65 @@ static uint32_t estimate_partition_list(uint32_t mode, const color_quad_i * pPix
             total_subset_err += err;
             if (err >= subset_budget) break;
         } // subset
+
+        // OPTION G: partition DC penalty.
+        // If m_partition_dc_penalty_weight > 0, add a penalty proportional to
+        // the DC difference between subsets. This discourages partitions that
+        // create a DC discontinuity across the partition boundary (the root
+        // cause of the "green brightening/darkening blob" artifact).
+        //
+        // For 2-subset modes (1, 3, 7): penalty = |mean_sub0 - mean_sub1| * weight
+        //   summed over R, G, B channels.
+        // For 3-subset modes (0, 2): penalty = max pairwise DC diff * weight.
+        //
+        // The penalty is added to total_subset_err before the insertion-sort
+        // comparison, so partitions with high DC mismatch get pushed down the
+        // ranked list. The actual block encoding (which uses true SSE) is
+        // unchanged — we're only influencing WHICH partition gets tried first.
+        const float dc_penalty_w = pComp_params->m_partition_dc_penalty_weight;
+        if (dc_penalty_w > 0.0f && total_subset_err < worst_err)
+        {
+            // Compute per-subset means for R, G, B (alpha excluded — DC bias
+            // artifact is on RGB, not alpha).
+            int sum_r[3] = {0,0,0}, sum_g[3] = {0,0,0}, sum_b[3] = {0,0,0};
+            for (uint32_t subset = 0; subset < total_subsets; subset++)
+            {
+                for (uint32_t i = 0; i < subset_total_colors[subset]; i++)
+                {
+                    sum_r[subset] += subset_colors[subset][i].m_c[0];
+                    sum_g[subset] += subset_colors[subset][i].m_c[1];
+                    sum_b[subset] += subset_colors[subset][i].m_c[2];
+                }
+            }
+            // Find max pairwise DC difference across subsets.
+            // For 2 subsets this is just |sub1 - sub0|.
+            // For 3 subsets we take the max of the 3 pairwise diffs (sub0-sub1,
+            // sub0-sub2, sub1-sub2) on each channel and sum across channels.
+            // (Using max-of-pairs rather than sum-of-pairs to avoid over-penalizing
+            // 3-subset modes which naturally have more inter-subset variation.)
+            int max_dc_diff = 0;
+            for (uint32_t s0 = 0; s0 < total_subsets; s0++)
+            {
+                for (uint32_t s1 = s0 + 1; s1 < total_subsets; s1++)
+                {
+                    int cnt0 = subset_total_colors[s0];
+                    int cnt1 = subset_total_colors[s1];
+                    if (cnt0 == 0 || cnt1 == 0) continue;
+                    int dr = std::abs(sum_r[s0] / cnt0 - sum_r[s1] / cnt1);
+                    int dg = std::abs(sum_g[s0] / cnt0 - sum_g[s1] / cnt1);
+                    int db = std::abs(sum_b[s0] / cnt0 - sum_b[s1] / cnt1);
+                    int pair_dc = dr + dg + db;
+                    if (pair_dc > max_dc_diff) max_dc_diff = pair_dc;
+                }
+            }
+            // Scale penalty: weight is a float in roughly [0, 8].
+            // max_dc_diff is in 0..765 range (3 channels * 0..255).
+            // We want penalty ~ weight * max_dc_diff to be comparable to
+            // typical SSE values (which are in the hundreds to thousands range
+            // for blocks with real variation).
+            uint64_t dc_penalty = (uint64_t)(dc_penalty_w * (float)max_dc_diff);
+            total_subset_err += dc_penalty;
+        }
 
         // Insert into sorted solutions (same as original)
         int32_t i;
@@ -4701,7 +4798,35 @@ static void handle_alpha_block(void * pBlock, const  color_quad_i * pPixels, con
                                 trial_err += err;
                                 if (trial_err > best_err) break;
                         } // subset
-                        if (trial_err < best_err)
+
+                        // OPTION G: apply DC penalty to final selection too.
+                        // We add the penalty to trial_err for the COMPARISON only,
+                        // but store the raw SSE in best_err (not the penalized
+                        // value) so subsequent mode comparisons remain fair.
+                        const float dc_w_m7 = pComp_params->m_partition_dc_penalty_weight;
+                        uint64_t trial_err_pen = trial_err;
+                        if (dc_w_m7 > 0.0f && trial_err < best_err)
+                        {
+                            int sum_r[2]={0,0}, sum_g[2]={0,0}, sum_b[2]={0,0};
+                            for (uint32_t subset = 0; subset < 2; subset++)
+                            {
+                                for (uint32_t i = 0; i < subset_total_colors7[subset]; i++)
+                                {
+                                    sum_r[subset] += subset_colors[subset][i].m_c[0];
+                                    sum_g[subset] += subset_colors[subset][i].m_c[1];
+                                    sum_b[subset] += subset_colors[subset][i].m_c[2];
+                                }
+                            }
+                            int cnt0 = subset_total_colors7[0];
+                            int cnt1 = subset_total_colors7[1];
+                            int dr = (cnt0 && cnt1) ? std::abs(sum_r[0]/cnt0 - sum_r[1]/cnt1) : 0;
+                            int dg = (cnt0 && cnt1) ? std::abs(sum_g[0]/cnt0 - sum_g[1]/cnt1) : 0;
+                            int db = (cnt0 && cnt1) ? std::abs(sum_b[0]/cnt0 - sum_b[1]/cnt1) : 0;
+                            uint64_t dc_pen = (uint64_t)(dc_w_m7 * (float)(dr + dg + db));
+                            trial_err_pen = trial_err + dc_pen;
+                        }
+
+                        if (trial_err_pen < best_err)
                         {
                                 best_err = trial_err;
                                 opt_results.m_mode = 7;
@@ -4766,137 +4891,6 @@ static void handle_alpha_block(void * pBlock, const  color_quad_i * pPixels, con
                                         opt_results.m_high[subset] = subset_results7[subset].m_high_endpoint;
                                         opt_results.m_pbits[subset][0] = subset_results7[subset].m_pbits[0];
                                         opt_results.m_pbits[subset][1] = subset_results7[subset].m_pbits[1];
-                                }
-                        }
-                }
-        }
-
-        // FIX FM (Force Mode 5/6 for bias-prone Mode 4 alpha blocks):
-        // Mode 4's 5-bit RGB endpoint grid (step 8) can cause systematic green
-        // DC bias when the optimal endpoint falls between grid points, visible
-        // as "patched brightening" / "blocky darkening" on the green channel.
-        // If Mode 4 won AND the green DC bias exceeds 1.5, try forcing Mode 6
-        // (7-bit RGB + 7-bit A + pbit = 8-bit, 16 shared selectors) first — it
-        // preserves alpha precision better than Mode 5. If Mode 6 doesn't help
-        // (or isn't available), fall back to Mode 5 (7-bit RGB + 8-bit A, 4
-        // selectors). Accept the forced mode only if:
-        //   (1) its green DC bias is actually lower than Mode 4's, AND
-        //   (2) its green SSE is not more than 1.5x Mode 4's (prevents the
-        //       forced mode from creating worse max-error artifacts, e.g.
-        //       Mode 6's 1-subset LSQ crushing outlier pixels).
-        // Skip if rotation != 0 (rare case; green lives in a different slot).
-        if (opt_results.m_mode == 4 && opt_results.m_rotation == 0)
-        {
-                // Decode winning Mode 4 green DC (5-bit RGB, no pbit, n=5)
-                const uint32_t n5 = 5;
-                uint32_t aLowG  = (opt_results.m_low[0].m_c[1]  << (8 - n5)) | (opt_results.m_low[0].m_c[1]  >> (2*n5 - 8));
-                uint32_t aHighG = (opt_results.m_high[0].m_c[1] << (8 - n5)) | (opt_results.m_high[0].m_c[1] >> (2*n5 - 8));
-                const uint32_t *sw_m4 = (opt_results.m_index_selector == 0) ? g_bc7_weights2 : g_bc7_weights3;
-                int m4_dec_g = 0, m4_in_g = 0;
-                uint64_t m4_sse_g = 0;
-                for (uint32_t i = 0; i < 16; i++) {
-                        uint32_t sel = opt_results.m_selectors[i];
-                        uint32_t w = sw_m4[sel];
-                        int dg = (int)(((64 - w) * aLowG + w * aHighG + 32) >> 6);
-                        m4_dec_g += dg;
-                        m4_in_g  += pPixels[i].m_c[1];
-                        int e = dg - pPixels[i].m_c[1];
-                        m4_sse_g += (uint64_t)(e * e);
-                }
-                float m4_bias = (float)(m4_dec_g - m4_in_g) / 16.0f;
-
-                if (m4_bias > 1.5f || m4_bias < -1.5f) {
-                        bool replaced = false;
-
-                        // Try Mode 6 first (better alpha precision than Mode 5).
-                        // Skip for outline blocks (alpha_range <= 16): Mode 6's shared
-                        // color+alpha selectors can't represent "constant alpha, varying
-                        // color" well, causing alpha regression. Outline blocks fall
-                        // through to Mode 5 (separate color/alpha selectors).
-                        if (!replaced && pComp_params->m_alpha_settings.m_use_mode6 &&
-                            !bimodal_alpha && !outline_alpha_block)
-                        {
-                                color_cell_compressor_params params6 = *pParams;
-                                params6.m_weights[0] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[0];
-                                params6.m_weights[1] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[1];
-                                params6.m_weights[2] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[2];
-                                params6.m_weights[3] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[3];
-                                params6.m_pSelector_weights = g_bc7_weights4;
-                                params6.m_pSelector_weightsx = (const vec4F *)&g_bc7_weights4x[0];
-                                params6.m_num_selector_weights = 16;
-                                params6.m_comp_bits = 7;
-                                params6.m_has_pbits = true;
-                                params6.m_endpoints_share_pbit = false;
-                                params6.m_has_alpha = true;
-                                params6.m_perceptual = pComp_params->m_perceptual;
-
-                                int selectors6[16];
-                                color_cell_compressor_results results6;
-                                results6.m_pSelectors = selectors6;
-                                int selectors_temp6[16];
-                                results6.m_pSelectors_temp = selectors_temp6;
-                                color_cell_compression(6, &params6, &results6, pComp_params, 16, pPixels, true);
-
-                                // Compute Mode 6 green DC bias AND SSE (7-bit + pbit = 8-bit)
-                                int m6_dec_g = 0;
-                                uint64_t m6_sse_g = 0;
-                                for (uint32_t i = 0; i < 16; i++) {
-                                        uint32_t sel = selectors6[i];
-                                        uint32_t w = g_bc7_weights4[sel];
-                                        uint32_t p0 = results6.m_pbits[0];
-                                        uint32_t p1 = results6.m_pbits[1];
-                                        uint32_t aLowG6  = (results6.m_low_endpoint.m_c[1]  << 1) | p0;
-                                        uint32_t aHighG6 = (results6.m_high_endpoint.m_c[1] << 1) | p1;
-                                        int dg = (int)(((64 - w) * aLowG6 + w * aHighG6 + 32) >> 6);
-                                        m6_dec_g += dg;
-                                        int e = dg - pPixels[i].m_c[1];
-                                        m6_sse_g += (uint64_t)(e * e);
-                                }
-                                float m6_bias = (float)(m6_dec_g - m4_in_g) / 16.0f;
-
-                                // Accept Mode 6 only if: (1) reduces |bias|, AND (2) SSE <= 1.5x Mode 4
-                                if (fabsf(m6_bias) < fabsf(m4_bias) && m6_sse_g <= (m4_sse_g * 3 + 1) / 2) {
-                                        opt_results.m_mode = 6;
-                                        opt_results.m_index_selector = 0;
-                                        opt_results.m_rotation = 0;
-                                        opt_results.m_partition = 0;
-                                        opt_results.m_low[0] = results6.m_low_endpoint;
-                                        opt_results.m_high[0] = results6.m_high_endpoint;
-                                        opt_results.m_pbits[0][0] = results6.m_pbits[0];
-                                        opt_results.m_pbits[0][1] = results6.m_pbits[1];
-                                        for (uint32_t i = 0; i < 16; i++) opt_results.m_selectors[i] = selectors6[i];
-                                        replaced = true;
-                                }
-                        }
-
-                        // Fall back to Mode 5 if Mode 6 didn't help
-                        if (!replaced && pComp_params->m_alpha_settings.m_use_mode5)
-                        {
-                                color_cell_compressor_params params5 = *pParams;
-                                bc7_optimization_results trial_opt_results5;
-                                uint64_t trial_mode5_err = 0;
-                                handle_alpha_block_mode5(pPixels, pComp_params, &params5, lo_a, hi_a, &trial_opt_results5, &trial_mode5_err);
-
-                                // Compute Mode 5 green DC bias AND SSE (7-bit RGB, no pbit, n=7)
-                                const uint32_t n7 = 7;
-                                uint32_t m5_aLowG  = (trial_opt_results5.m_low[0].m_c[1]  << (8 - n7)) | (trial_opt_results5.m_low[0].m_c[1]  >> (2*n7 - 8));
-                                uint32_t m5_aHighG = (trial_opt_results5.m_high[0].m_c[1] << (8 - n7)) | (trial_opt_results5.m_high[0].m_c[1] >> (2*n7 - 8));
-                                int m5_dec_g = 0;
-                                uint64_t m5_sse_g = 0;
-                                for (uint32_t i = 0; i < 16; i++) {
-                                        uint32_t sel = trial_opt_results5.m_selectors[i];
-                                        uint32_t w = g_bc7_weights2[sel];
-                                        int dg = (int)(((64 - w) * m5_aLowG + w * m5_aHighG + 32) >> 6);
-                                        m5_dec_g += dg;
-                                        int e = dg - pPixels[i].m_c[1];
-                                        m5_sse_g += (uint64_t)(e * e);
-                                }
-                                float m5_bias = (float)(m5_dec_g - m4_in_g) / 16.0f;
-
-                                // Accept Mode 5 only if: (1) reduces |bias|, AND (2) SSE <= 1.5x Mode 4
-                                if (fabsf(m5_bias) < fabsf(m4_bias) && m5_sse_g <= (m4_sse_g * 3 + 1) / 2) {
-                                        opt_results = trial_opt_results5;
-                                        opt_results.m_rotation = 0;
                                 }
                         }
                 }
@@ -5783,90 +5777,6 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
                         opt_results.m_pbits[0][1] = results6.m_pbits[1];
                 }
 
-        // FIX FM (Force Mode 6 for bias-prone Mode 1 opaque blocks):
-        // Mode 1's 2-subset partition with 3-bit selectors can cause systematic
-        // green DC bias from selector mismatches between subsets, visible as
-        // "patched brightening" / "blocky darkening" on the green channel.
-        // If Mode 1 won AND the green DC bias exceeds 1.5, force-encode as
-        // Mode 6 (1-subset, 7-bit RGB + pbit = 8-bit, 16 selectors) to
-        // eliminate the bias. Accept the forced Mode 6 only if:
-        //   (1) its green DC bias is actually lower than Mode 1's, AND
-        //   (2) its green SSE is not more than 1.5x Mode 1's (prevents the
-        //       forced mode from creating worse max-error artifacts).
-        if (opt_results.m_mode == 1 && pComp_params->m_opaque_settings.m_use_mode[6])
-        {
-                // Decode winning Mode 1 green DC (6-bit color + shared pbit = 7-bit)
-                const int *pPart1 = &g_bc7_partition2[opt_results.m_partition * 16];
-                int m1_dec_g = 0, m1_in_g = 0;
-                uint64_t m1_sse_g = 0;
-                for (uint32_t i = 0; i < 16; i++) {
-                        uint32_t p = pPart1[i];
-                        uint32_t sel = opt_results.m_selectors[i];
-                        uint32_t w = g_bc7_weights3[sel];  // Mode 1 uses 3-bit selectors
-                        uint32_t pbit = opt_results.m_pbits[p][0];  // shared pbit
-                        uint32_t low_7bit  = (opt_results.m_low[p].m_c[1]  << 1) | pbit;
-                        uint32_t high_7bit = (opt_results.m_high[p].m_c[1] << 1) | pbit;
-                        // Scale 7-bit to 8-bit: (c << 1) | (c >> 6)
-                        uint32_t aLowG  = (low_7bit  << 1) | (low_7bit  >> 6);
-                        uint32_t aHighG = (high_7bit << 1) | (high_7bit >> 6);
-                        int dg = (int)(((64 - w) * aLowG + w * aHighG + 32) >> 6);
-                        m1_dec_g += dg;
-                        m1_in_g  += pPixels[i].m_c[1];
-                        int e = dg - pPixels[i].m_c[1];
-                        m1_sse_g += (uint64_t)(e * e);
-                }
-                float m1_bias = (float)(m1_dec_g - m1_in_g) / 16.0f;
-
-                if (m1_bias > 1.5f || m1_bias < -1.5f) {
-                        // Force-encode as Mode 6 (1-subset, 7-bit + pbit = 8-bit)
-                        color_cell_compressor_params params6 = *pParams;
-                        params6.m_pSelector_weights = g_bc7_weights4;
-                        params6.m_pSelector_weightsx = (const vec4F *)&g_bc7_weights4x[0];
-                        params6.m_num_selector_weights = 16;
-                        params6.m_comp_bits = 7;
-                        params6.m_has_pbits = true;
-                        params6.m_endpoints_share_pbit = false;
-                        params6.m_has_alpha = false;
-                        params6.m_perceptual = pComp_params->m_perceptual;
-
-                        color_cell_compressor_results results6;
-                        int selectors6[16];
-                        results6.m_pSelectors = selectors6;
-                        results6.m_pSelectors_temp = selectors_temp;
-                        color_cell_compression(6, &params6, &results6, pComp_params, 16, pPixels, true);
-
-                        // Compute Mode 6 green DC bias AND SSE (7-bit + pbit = 8-bit)
-                        int m6_dec_g = 0;
-                        uint64_t m6_sse_g = 0;
-                        for (uint32_t i = 0; i < 16; i++) {
-                                uint32_t sel = selectors6[i];
-                                uint32_t w = g_bc7_weights4[sel];  // Mode 6 uses 4-bit selectors
-                                uint32_t p0 = results6.m_pbits[0];
-                                uint32_t p1 = results6.m_pbits[1];
-                                uint32_t aLowG  = (results6.m_low_endpoint.m_c[1]  << 1) | p0;
-                                uint32_t aHighG = (results6.m_high_endpoint.m_c[1] << 1) | p1;
-                                int dg = (int)(((64 - w) * aLowG + w * aHighG + 32) >> 6);
-                                m6_dec_g += dg;
-                                int e = dg - pPixels[i].m_c[1];
-                                m6_sse_g += (uint64_t)(e * e);
-                        }
-                        float m6_bias = (float)(m6_dec_g - m1_in_g) / 16.0f;
-
-                        // Accept Mode 6 only if: (1) reduces |bias|, AND (2) SSE <= 1.5x Mode 1
-                        if (fabsf(m6_bias) < fabsf(m1_bias) && m6_sse_g <= (m1_sse_g * 3 + 1) / 2) {
-                                opt_results.m_mode = 6;
-                                opt_results.m_index_selector = 0;
-                                opt_results.m_rotation = 0;
-                                opt_results.m_partition = 0;
-                                opt_results.m_low[0] = results6.m_low_endpoint;
-                                opt_results.m_high[0] = results6.m_high_endpoint;
-                                opt_results.m_pbits[0][0] = results6.m_pbits[0];
-                                opt_results.m_pbits[0][1] = results6.m_pbits[1];
-                                for (uint32_t i = 0; i < 16; i++) opt_results.m_selectors[i] = selectors6[i];
-                        }
-                }
-        }
-
                 encode_bc7_block(pBlock, &opt_results);
 }
 
@@ -6088,6 +5998,9 @@ void bc7e_compress_block_params_init(bc7e_compress_block_params *  p,  bool perc
                 p->m_mode4_index_mask = 3;
                 p->m_mode5_rotation_mask = 0xF;
                 p->m_uber1_mask = 7;
+
+                // OPTION G: disabled by default — set via env var DCPENALY=f in test harness
+                p->m_partition_dc_penalty_weight = 0.0f;
 
                 p->m_opaque_settings.m_use_mode[0] = false;
                 p->m_opaque_settings.m_use_mode[1] = true;
