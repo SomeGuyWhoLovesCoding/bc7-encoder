@@ -96,50 +96,12 @@ And as a final conclusion...
 
 The end. Now, please try it out. Your mind will be BLOWN.
 
-*Wait, I forgot something. Not only is it fast on its own, but thanks to recently implementing a concurrency technique known as "atomic work stealing" (kudos to qwen3.7-plus), encoding to bc7 can now be as fast as humanly possible on like L1 cache, which is ridiculous, so in theory, this is the fastest possible software bc7 compression tool indefinitely.*
+*Wait, I forgot something. Not only is it fast on its own, but thanks to recently implementing a concurrency technique known as "atomic work stealing" (kudos to qwen3.7-plus), and also limiting computation of mode 1 with best_err < 128 (improving quality), encoding to bc7 can now be as fast as humanly possible on like L1 cache, which is ridiculous, so in theory, this is the fastest possible software bc7 compression tool indefinitely.*
 
 ## Benchmark (sorta)
 
-The numbers speak for themselves:
+The numbers speak for themselves in this [PDF](ProfilingSpec.pdf) here.
 
-```
-F:\_\NewDownloads\official-bc7-encoder\v3>myprogram dad.png dad.dds
-Loaded dad.png: 3950x1680 (4 ch)
-Encoder path: Scalar
-Encoded 414960 blocks in 127.9 ms (3245074 blocks/sec, 6 threads, Scalar)
-Original: 26544000 bytes, BC7: 6639360 bytes (4.00:1, 25.0%)
-Wrote dad.dds
-
-F:\_\NewDownloads\official-bc7-encoder\v3>myprogram dad.png dad.dds
-Loaded dad.png: 3950x1680 (4 ch)
-Encoder path: Scalar
-Encoded 414960 blocks in 133.3 ms (3113060 blocks/sec, 6 threads, Scalar)
-Original: 26544000 bytes, BC7: 6639360 bytes (4.00:1, 25.0%)
-Wrote dad.dds
-
-F:\_\NewDownloads\official-bc7-encoder\v3>myprogram dad.png dad.dds
-Loaded dad.png: 3950x1680 (4 ch)
-Encoder path: Scalar
-Encoded 414960 blocks in 121.0 ms (3430068 blocks/sec, 6 threads, Scalar)
-Original: 26544000 bytes, BC7: 6639360 bytes (4.00:1, 25.0%)
-Wrote dad.dds
-
-F:\_\NewDownloads\official-bc7-encoder\v3>myprogram dad.png dad.dds
-Loaded dad.png: 3950x1680 (4 ch)
-Encoder path: Scalar
-Encoded 414960 blocks in 131.1 ms (3166116 blocks/sec, 6 threads, Scalar)
-Original: 26544000 bytes, BC7: 6639360 bytes (4.00:1, 25.0%)
-Wrote dad.dds
-```
-
-Compared to texconv, if the same size, would be SO much slower, like I'm talking a rough ~7.9x slowdown on the exact spritesheet and its size, just to get as good of an output quality as with this tool.
-
-and compared to amd's compressonator, which in fact is even worse than texconv, and I'm also forced to multiple by 4 texture if I try to do GPU mode, but I'll say it's like around 18-20 times due to how slow it compresses even a texture that's only ~500x500, which in fact I have known the default is basically max quality.
-
-*I even had to time it myself with stopwatch on windows' Clock app due to the fact there's no said precise time being printed in the end.*
+*Do note this was entirely generated via GLM 5.1 from z.ai and was vastly adjusted based on sources of the CPU's selected in the document. The benchmark results are a projection extrapolated from one benchmark of the agent's CPU specs.*
 
 It also doesn't matter if it's power of two, because this is entirely CPU-based and multithreaded.
-
-## Comparison time! (finally)
-
-... New comin
