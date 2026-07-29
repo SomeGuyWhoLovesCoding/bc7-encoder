@@ -1,4 +1,5 @@
 // bc7_encoder_example.cpp - Multithreaded scalar BC7 encoder with atomic work stealing
+//                          + M7TO5 post-encode bias fix (NO DECODING).
 //
 // IMPORTANT: This must be compiled as a single translation unit because
 // bc7_encoder_base.h defines non-inline functions and globals (g_codec_initialized).
@@ -6,12 +7,6 @@
 // SIMD paths (bc7_encoder_simd.h / bc7_encoder_dispatch.h / bc7_encoder_simd_impl.inc)
 // have been stripped entirely. The encoder uses the scalar path
 // (bc7e_compress_block_range from bc7_encoder_base.h) only.
-//
-// Rationale: on 3950x1680 input the AVX2 8-wide path was hard-wired to
-// mode 6 (Paeth) only and was both broken AND slower than scalar. SSE2/SSE4
-// 4-wide paths were also slower than scalar in practice because the
-// dispatch + per-block setup overhead exceeded the per-block SIMD gain.
-// Scalar-only is simpler AND faster, so we keep only that path.
 //
 // Build (GCC/Clang) - no -mavx2 needed:
 //   g++ -std=c++17 -O2 -pthread -I. -o bc7_encoder_example bc7_encoder_example.cpp -lm
@@ -23,9 +18,37 @@
 //   bc7_encoder_example input.png output.dds
 //
 // Quality is locked to level 2 (default/balanced).
-// Uses all available CPU cores via std::thread with atomic work stealing 
-// (chunked dynamic scheduling) to ensure optimal load balancing and prevent 
+// Uses all available CPU cores via std::thread with atomic work stealing
+// (chunked dynamic scheduling) to ensure optimal load balancing and prevent
 // tail latency from variable block compression times.
+//
+// ============================================================================
+// M7TO5 POST-ENCODE BIAS FIX (NO DECODING)
+// ============================================================================
+// After the main encode, a selective post-encode pass walks every block.
+// For each block currently encoded in Mode 4 (5-bit endpoints, 1-subset) or
+// Mode 7 (5-bit endpoints, 2-subset) — the two bias-prone modes — we estimate
+// the green DC bias directly from the encoded endpoint bits, WITHOUT calling
+// any decoder. If |estimated_bias| > threshold (1.0), we re-encode that one
+// block in Mode 5 only AND Mode 6 only (both 7-bit endpoints, single-subset),
+// estimate the new bias for each candidate the same way (from endpoints), and
+// swap in whichever candidate has the lowest |bias|, provided it actually
+// improves on the original. No SSE check is performed (the user's preferred
+// tol=1000% effectively disabled it anyway). No decode library is invoked
+// during the post-encode pass.
+//
+// Bias estimation:
+//   For Mode 4/5/6 (1-subset):  avg_decoded_g ~= (e0_g_8 + e1_g_8) / 2
+//   For Mode 7     (2-subset):  avg_decoded_g ~= (n0*(e0_g_8+e1_g_8)/2
+//                                            +  n1*(e2_g_8+e3_g_8)/2) / 16
+//   where n0/n1 are pixel counts per subset from the partition table.
+//
+//   bias = avg_decoded_g - avg_input_g
+//
+// This is an approximation (assumes uniform index distribution within each
+// subset), but for the smooth regions that actually suffer from DC bias the
+// distribution is typically diverse enough that (e0+e1)/2 is a good estimate.
+// ============================================================================
 
 #include "bc7_encoder_base.h"
 #include "bc7_metrics.h"
@@ -43,9 +66,16 @@
 #include <chrono>
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
+
+// ---------------------------------------------------------------------------
+// M7TO5 post-encode: NO DECODING. Bias estimated from endpoint bits directly.
+// ---------------------------------------------------------------------------
+#include "m7to5_nodecode.h"
+
 
 //
 // Minimal DDS writer (BC7, DX10 extended header)
@@ -187,20 +217,17 @@ public:
             // Instead of statically partitioning blocks, threads atomically fetch chunks of work.
             // This prevents tail latency caused by variable block compression times.
             std::atomic<uint32_t> next_block{0};
-            
+
             // Chunk size balances atomic contention overhead vs load balancing granularity.
-            // 64 blocks per chunk is a robust default for BC7 scalar encoding. 
-            // Tune this value (e.g., 32, 64, 128) based on your specific CPU and image characteristics.
+            // 64 blocks per chunk is a robust default for BC7 scalar encoding.
             constexpr uint32_t chunk_size = 64;
 
             auto worker = [&]() {
                 while (true) {
-                    // Atomically claim a chunk of blocks
                     uint32_t start = next_block.fetch_add(chunk_size, std::memory_order_relaxed);
                     if (start >= total_blocks) {
-                        break; // No more work to steal
+                        break;
                     }
-                    
                     uint32_t count = std::min(chunk_size, total_blocks - start);
                     g_encode_fn(start, count, blocks.data(), pixels_rgba.data(), &params);
                 }
@@ -225,13 +252,25 @@ public:
                 encode_ms > 0 ? (total_blocks / (encode_ms / 1000.0)) : 0.0,
                 num_threads);
 
+        // ---- M7TO5 POST-ENCODE BIAS FIX (NO DECODING) ----
+        // Selectively re-encode Mode 4 / Mode 7 blocks with high green DC
+        // bias into Mode 5 or Mode 6 (7-bit endpoints, single-subset) to
+        // eliminate the block-aligned discoloration blobs caused by 5-bit
+        // endpoint quantization. Bias is estimated directly from the encoded
+        // endpoint bits — no decoder is invoked.
+        auto t2 = std::chrono::high_resolution_clock::now();
+        m7to5_nodecode::run(blocks.data(), pixels_rgba.data(), total_blocks,
+                            &params, /*bias_threshold=*/1.0f, num_threads);
+        auto t3 = std::chrono::high_resolution_clock::now();
+        double post_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
+        fprintf(stderr, "M7TO5 post-encode: %.1f ms\n", post_ms);
+
         bc7_out.resize(total_blocks * 16);
         memcpy(bc7_out.data(), blocks.data(), total_blocks * 16);
     }
 
 private:
     // Hard-point the function pointer at the scalar implementation from base.h.
-    // No CPUID detection, no SIMD fallback ladder, no per-thread dispatch cache.
     static const compress_fn g_encode_fn;
 };
 
@@ -241,7 +280,7 @@ const BC7Encoder::compress_fn BC7Encoder::g_encode_fn = bc7e_compress_block_rang
 static void generate_mode_visualization(const char* filename, const uint8_t* bc7_data, int width, int height) {
     int bw = (width + 3) / 4;
     int bh = (height + 3) / 4;
-    
+
     // Colors for each mode (RGB)
     uint8_t mode_colors[8][3] = {
         {0, 255, 255},   // Mode 0: Cyan
@@ -260,7 +299,7 @@ static void generate_mode_visualization(const char* filename, const uint8_t* bc7
         for (int bx = 0; bx < bw; bx++) {
             int block_idx = by * bw + bx;
             uint8_t first_byte = bc7_data[block_idx * 16];
-            
+
             // Extract mode from the first byte (lowest set bit)
             uint32_t mode = 0;
             while (mode < 8 && !(first_byte & (1 << mode))) mode++;
@@ -331,18 +370,17 @@ int main(int argc, char* argv[])
     }
     fprintf(stderr, "Wrote %s\n", out_path);
 
-    // ── Mode Visualization ──
-    // Generates a PPM image where each 4x4 block is colored by its chosen BC7 mode.
-    /*std::string mode_vis_path = out_path;
+    // Mode Visualization
+    std::string mode_vis_path = out_path;
     size_t dot_pos = mode_vis_path.find_last_of('.');
     if (dot_pos != std::string::npos) {
         mode_vis_path = mode_vis_path.substr(0, dot_pos) + "_modes.ppm";
     } else {
         mode_vis_path += "_modes.ppm";
     }
-    generate_mode_visualization(mode_vis_path.c_str(), bc7.data(), w, h);*/
+    generate_mode_visualization(mode_vis_path.c_str(), bc7.data(), w, h);
 
-    // ── Quality Metrics (matches bc7enc output format) ──
+    // Quality Metrics (matches bc7enc output format)
     compute_and_print_all_metrics(pixels, bc7.data(), bc7.size(), w, h);
 
     stbi_image_free(pixels);
