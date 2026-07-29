@@ -48,10 +48,10 @@ static inline T ispc_select(bool cond, T a, T b) { return cond ? a : b; }
 
 #define BC7E_2SUBSET_CHECKERBOARD_PARTITION_INDEX (34)
 #define BC7E_BLOCK_SIZE (16)
-#define BC7E_MAX_PARTITIONS0 (8)
-#define BC7E_MAX_PARTITIONS1 (16) // set from 32 to 16
-#define BC7E_MAX_PARTITIONS2 (16) // keep this at 16 minimum
-#define BC7E_MAX_PARTITIONS3 (32) // was 32 but i dont think mode 3 uhhhhhhh
+#define BC7E_MAX_PARTITIONS0 (1)
+#define BC7E_MAX_PARTITIONS1 (32)
+#define BC7E_MAX_PARTITIONS2 (64)
+#define BC7E_MAX_PARTITIONS3 (16)
 #define BC7E_MAX_PARTITIONS7 (32)
 #define BC7E_MAX_UBER_LEVEL (4)
 
@@ -119,7 +119,19 @@ struct bc7e_compress_block_params
                 // (any multi-subset mode). Single-subset modes (4, 5, 6) are
                 // unaffected (they have no partition).
                 float m_partition_dc_penalty_weight;
-                
+
+                // Internal flag: when true, the encoder bypasses the
+                // max_color_range<128 guard in handle_alpha_block's Mode 5 path
+                // and the corresponding guards in Mode 6 paths. Used by
+                // bc7e_apply_m7to5_fallback() when re-encoding a block in
+                // Mode 5/6 only — without this, high-contrast blocks (arrow
+                // on dark background) would skip Mode 5 and emit garbage.
+                //
+                // NOTE: bc7e_compress_block_init() sets this to false. Callers
+                // that want single-mode-only re-encoding must opt in explicitly
+                // (see make_single_mode_params_unguarded / make_single_mode_params).
+                bool m_force_single_mode;
+
                 struct
                 {
                                 uint32_t m_max_mode13_partitions_to_try;
@@ -591,92 +603,206 @@ static void compute_block_stats(bc7_block_stats * pStats, const color_quad_i * p
                 pStats->is_opaque = (min_a == 255);
 }
 
-// Luma/RGB-based fast partition estimator for 2-subset modes (1, 3).
-// Now dynamically sorts by the dominant RGB channel to fix luma-collision PSNR drops.
+// Fast partition estimator for 2-subset modes (1, 3).
+// Improved: PCA principal-axis sort + multi-axis candidates + full RGB variance
+// + 4 spatial candidate assignments. Catches partition patterns the single-axis
+// luma-only approach misses (e.g. clusters separated along R-G or R+G+B, or
+// purely spatial splits like top/bottom, left/right, checkerboard).
 static uint32_t quick_estimate_partition_2subset(const color_quad_i * pPixels, const bc7_block_stats * pStats, const bc7e_compress_block_params * pComp_params)
 {
-                // 1. Find the dominant RGB channel (the one with the largest min/max range)
-                int min_r = 255, max_r = 0;
-                int min_g = 255, max_g = 0;
-                int min_b = 255, max_b = 0;
+                (void)pStats;
+                const uint32_t max_parts = minimumu(pComp_params->m_max_partitions_mode[1], 64u);
 
+                // === Step 1: Compute centroid and 3x3 covariance (integer, 16x scaled) ===
+                int sum_r = 0, sum_g = 0, sum_b = 0;
+                for (int i = 0; i < 16; i++)
+                {
+                                sum_r += pPixels[i].m_c[0];
+                                sum_g += pPixels[i].m_c[1];
+                                sum_b += pPixels[i].m_c[2];
+                }
+
+                int64_t cxx = 0, cyy = 0, czz = 0, cxy = 0, cxz = 0, cyz = 0;
+                for (int i = 0; i < 16; i++)
+                {
+                                int dr = pPixels[i].m_c[0] * 16 - sum_r;
+                                int dg = pPixels[i].m_c[1] * 16 - sum_g;
+                                int db = pPixels[i].m_c[2] * 16 - sum_b;
+                                cxx += (int64_t)dr * dr;
+                                cyy += (int64_t)dg * dg;
+                                czz += (int64_t)db * db;
+                                cxy += (int64_t)dr * dg;
+                                cxz += (int64_t)dr * db;
+                                cyz += (int64_t)dg * db;
+                }
+
+                // === Step 2: Power iteration to find principal eigenvector ===
+                // Fixed-point (scale 256 = 1.0). 5 iterations is plenty for a 3x3 matrix.
+                int64_t vx = 256, vy = 256, vz = 256;
+                for (int iter = 0; iter < 5; iter++)
+                {
+                                int64_t nx = vx * cxx + vy * cxy + vz * cxz;
+                                int64_t ny = vx * cxy + vy * cyy + vz * cyz;
+                                int64_t nz = vx * cxz + vy * cyz + vz * czz;
+                                int64_t ax = nx < 0 ? -nx : nx;
+                                int64_t ay = ny < 0 ? -ny : ny;
+                                int64_t az = nz < 0 ? -nz : nz;
+                                int64_t m = ax; if (ay > m) m = ay; if (az > m) m = az;
+                                if (m == 0) { vx = vy = vz = 256; break; }
+                                vx = (nx * 256) / m;
+                                vy = (ny * 256) / m;
+                                vz = (nz * 256) / m;
+                }
+
+                // === Step 3: Build sort keys for 4 candidate axes: PCA, R, G, B ===
+                int axes[4][16];
                 for (int i = 0; i < 16; i++)
                 {
                                 int r = pPixels[i].m_c[0];
                                 int g = pPixels[i].m_c[1];
                                 int b = pPixels[i].m_c[2];
-
-                                if (r < min_r) min_r = r; if (r > max_r) max_r = r;
-                                if (g < min_g) min_g = g; if (g > max_g) max_g = g;
-                                if (b < min_b) min_b = b; if (b > max_b) max_b = b;
+                                axes[0][i] = (int)((int64_t)r * vx + (int64_t)g * vy + (int64_t)b * vz);
+                                axes[1][i] = r;
+                                axes[2][i] = g;
+                                axes[3][i] = b;
                 }
-
-                int range_r = max_r - min_r;
-                int range_g = max_g - min_g;
-                int range_b = max_b - min_b;
-
-                // 2. Populate sort keys based on the dominant channel
-                int sort_keys[16];
-                if (range_r >= range_g && range_r >= range_b)
-                {
-                                for (int i = 0; i < 16; i++) sort_keys[i] = pPixels[i].m_c[0];
-                }
-                else if (range_g >= range_b) 
-                {
-                                for (int i = 0; i < 16; i++) sort_keys[i] = pPixels[i].m_c[1];
-                }
-                else
-                {
-                                for (int i = 0; i < 16; i++) sort_keys[i] = pPixels[i].m_c[2];
-                }
-
-                // 3. Sort pixel indices by the dominant channel keys
-                int order[16];
-                for (int i = 0; i < 16; i++) order[i] = i;
-                
-                // Simple insertion sort (16 elements)
-                for (int i = 1; i < 16; i++)
-                {
-                                int key = order[i];
-                                int kv = sort_keys[key];
-                                int j = i - 1;
-                                while (j >= 0 && sort_keys[order[j]] > kv)
-                                {
-                                                order[j + 1] = order[j];
-                                                j--;
-                                }
-                                order[j + 1] = key;
-                }
-
-                // --- ORIGINAL LUMA VARIANCE LOGIC BELOW ---
 
                 const int splits[] = { 3, 4, 5, 6, 7, 8, 9, 10 };
-
                 uint64_t best_err = UINT64_MAX;
                 uint32_t best_partition = 0;
 
-                uint32_t max_parts = minimumu(pComp_params->m_max_partitions_mode[1], 64u);
-                const int *lum = pStats->luma;
-
-                for (int si = 0; si < 8; si++)
+                // === Step 4: For each axis, sort and try all 8 split points ===
+                // Uses full RGB variance (sum of per-channel variance) instead of luma-only.
+                for (int axis_idx = 0; axis_idx < 4; axis_idx++)
                 {
-                                int split = splits[si];
+                                const int *keys = axes[axis_idx];
 
-                                int sum_a = 0, sum_b = 0;
-                                int sq_a = 0, sq_b = 0;
-                                for (int i = 0; i < split; i++) { int v = lum[order[i]]; sum_a += v; sq_a += v * v; }
-                                for (int i = split; i < 16; i++) { int v = lum[order[i]]; sum_b += v; sq_b += v * v; }
+                                int order[16];
+                                for (int i = 0; i < 16; i++) order[i] = i;
+                                for (int i = 1; i < 16; i++)
+                                {
+                                                int key = order[i];
+                                                int kv = keys[key];
+                                                int j = i - 1;
+                                                while (j >= 0 && keys[order[j]] > kv)
+                                                {
+                                                                order[j + 1] = order[j];
+                                                                j--;
+                                                }
+                                                order[j + 1] = key;
+                                }
 
-                                int na = split, nb = 16 - split;
-                                int var_a = (sq_a * na - sum_a * sum_a);
-                                int var_b = (sq_b * nb - sum_b * sum_b);
-                                int intra_var = var_a + var_b;
+                                for (int si = 0; si < 8; si++)
+                                {
+                                                int split = splits[si];
+                                                int na = split, nb = 16 - split;
 
-                                if (intra_var >= (int)best_err)
-                                                continue;
+                                                int sum_ra = 0, sum_rb = 0, sum_ga = 0, sum_gb = 0, sum_ba = 0, sum_bb = 0;
+                                                int sq_ra = 0, sq_rb = 0, sq_ga = 0, sq_gb = 0, sq_ba = 0, sq_bb = 0;
+                                                for (int i = 0; i < split; i++)
+                                                {
+                                                                int idx = order[i];
+                                                                int r = pPixels[idx].m_c[0], g = pPixels[idx].m_c[1], b = pPixels[idx].m_c[2];
+                                                                sum_ra += r; sq_ra += r * r;
+                                                                sum_ga += g; sq_ga += g * g;
+                                                                sum_ba += b; sq_ba += b * b;
+                                                }
+                                                for (int i = split; i < 16; i++)
+                                                {
+                                                                int idx = order[i];
+                                                                int r = pPixels[idx].m_c[0], g = pPixels[idx].m_c[1], b = pPixels[idx].m_c[2];
+                                                                sum_rb += r; sq_rb += r * r;
+                                                                sum_gb += g; sq_gb += g * g;
+                                                                sum_bb += b; sq_bb += b * b;
+                                                }
 
+                                                int64_t var_a = (int64_t)(sq_ra * na - sum_ra * sum_ra)
+                                                              + (int64_t)(sq_ga * na - sum_ga * sum_ga)
+                                                              + (int64_t)(sq_ba * na - sum_ba * sum_ba);
+                                                int64_t var_b = (int64_t)(sq_rb * nb - sum_rb * sum_rb)
+                                                              + (int64_t)(sq_gb * nb - sum_gb * sum_gb)
+                                                              + (int64_t)(sq_bb * nb - sum_bb * sum_bb);
+                                                int64_t intra_var = var_a + var_b;
+
+                                                // Lower-bound: if intra_var alone >= best_err, no mismatches count can beat it.
+                                                if ((uint64_t)intra_var >= best_err)
+                                                                continue;
+
+                                                int assignment[16];
+                                                for (int i = 0; i < 16; i++) assignment[order[i]] = (i < split) ? 0 : 1;
+
+                                                for (uint32_t part = 0; part < max_parts; part++)
+                                                {
+                                                                const int *pPart = &g_bc7_partition2[part * 16];
+                                                                int mismatches = 0;
+                                                                for (int i = 0; i < 16; i++)
+                                                                {
+                                                                                if (pPart[i] != assignment[i])
+                                                                                                mismatches++;
+                                                                }
+                                                                uint64_t err = (uint64_t)mismatches * 0x10000ULL + (uint64_t)intra_var;
+                                                                if (err < best_err)
+                                                                {
+                                                                                best_err = err;
+                                                                                best_partition = part;
+                                                                }
+                                                }
+                                }
+                }
+
+                // === Step 5: Try 4 spatial candidate assignments ===
+                // These catch BC7 patterns that don't align with any color-sort split
+                // (e.g. pure spatial splits: top/bottom, left/right, checkerboard, stripes).
+                for (int sp = 0; sp < 4; sp++)
+                {
                                 int assignment[16];
-                                for (int i = 0; i < 16; i++) assignment[order[i]] = (i < split) ? 0 : 1;
+                                for (int i = 0; i < 16; i++)
+                                {
+                                                int row = i >> 2, col = i & 3;
+                                                int a;
+                                                switch (sp)
+                                                {
+                                                case 0: a = (row < 2) ? 0 : 1; break;                       // top/bottom half
+                                                case 1: a = (col < 2) ? 0 : 1; break;                       // left/right half
+                                                case 2: a = ((row + col) & 1) ? 1 : 0; break;               // checkerboard
+                                                default: a = (row & 1) ? 1 : 0; break;                      // horizontal stripes
+                                                }
+                                                assignment[i] = a;
+                                }
+
+                                int sum_ra = 0, sum_rb = 0, sum_ga = 0, sum_gb = 0, sum_ba = 0, sum_bb = 0;
+                                int sq_ra = 0, sq_rb = 0, sq_ga = 0, sq_gb = 0, sq_ba = 0, sq_bb = 0;
+                                int na = 0, nb = 0;
+                                for (int i = 0; i < 16; i++)
+                                {
+                                                int r = pPixels[i].m_c[0], g = pPixels[i].m_c[1], b = pPixels[i].m_c[2];
+                                                if (assignment[i] == 0)
+                                                {
+                                                                sum_ra += r; sq_ra += r * r;
+                                                                sum_ga += g; sq_ga += g * g;
+                                                                sum_ba += b; sq_ba += b * b;
+                                                                na++;
+                                                }
+                                                else
+                                                {
+                                                                sum_rb += r; sq_rb += r * r;
+                                                                sum_gb += g; sq_gb += g * g;
+                                                                sum_bb += b; sq_bb += b * b;
+                                                                nb++;
+                                                }
+                                }
+                                if (na == 0 || nb == 0) continue;
+
+                                int64_t var_a = (int64_t)(sq_ra * na - sum_ra * sum_ra)
+                                              + (int64_t)(sq_ga * na - sum_ga * sum_ga)
+                                              + (int64_t)(sq_ba * na - sum_ba * sum_ba);
+                                int64_t var_b = (int64_t)(sq_rb * nb - sum_rb * sum_rb)
+                                              + (int64_t)(sq_gb * nb - sum_gb * sum_gb)
+                                              + (int64_t)(sq_bb * nb - sum_bb * sum_bb);
+                                int64_t intra_var = var_a + var_b;
+
+                                if ((uint64_t)intra_var >= best_err)
+                                                continue;
 
                                 for (uint32_t part = 0; part < max_parts; part++)
                                 {
@@ -687,7 +813,7 @@ static uint32_t quick_estimate_partition_2subset(const color_quad_i * pPixels, c
                                                                 if (pPart[i] != assignment[i])
                                                                                 mismatches++;
                                                 }
-                                                uint64_t err = (uint64_t)mismatches * 0x10000ULL + intra_var;
+                                                uint64_t err = (uint64_t)mismatches * 0x10000ULL + (uint64_t)intra_var;
                                                 if (err < best_err)
                                                 {
                                                                 best_err = err;
@@ -1590,6 +1716,12 @@ static uint64_t evaluate_solution(const color_quad_i *pLow, const color_quad_i *
         float wr = pParams->m_weights[0]; float wg = pParams->m_weights[1];
         float wb = pParams->m_weights[2]; float wa = pParams->m_weights[3];
 
+        // LOSSLESS EARLY-EXIT: cache the current best error for mid-loop comparison.
+        // If total_errf exceeds this at any point, the solution cannot win, so we skip
+        // the remaining pixels. Provably lossless: errors are non-negative, so the final
+        // total_err >= current total_errf > best, meaning pResults won't be updated anyway.
+        const float early_exit_threshold = (float)pResults->m_best_overall_err;
+
         // Precompute float weighted colors for N=8, N=4, and perceptual modes
         color_quad_f weightedColors[16];
         weightedColors[0].m_c[0] = actualMinColor.m_c[0]; weightedColors[0].m_c[1] = actualMinColor.m_c[1];
@@ -1646,7 +1778,7 @@ static uint64_t evaluate_solution(const color_quad_i *pLow, const color_quad_i *
                                         const __m128i vbs[2] = { vb_lo, vb_hi };
 
                                         for (uint32_t i = 0; i < num_pixels; i++) {
-                                                if (dup_of[i] >= 0) { pResults->m_pSelectors_temp[i] = pResults->m_pSelectors_temp[dup_of[i]]; total_errf += pixel_err[dup_of[i]]; continue; }
+                                                if (dup_of[i] >= 0) { pResults->m_pSelectors_temp[i] = pResults->m_pSelectors_temp[dup_of[i]]; total_errf += pixel_err[dup_of[i]]; if (total_errf > early_exit_threshold) return (uint64_t)total_errf; continue; }
                                                 const color_quad_i *pC = &pPixels[i];
                                                 const __m128i vpr = _mm_set1_epi16((short)pC->m_c[0]);
                                                 const __m128i vpg = _mm_set1_epi16((short)pC->m_c[1]);
@@ -1683,13 +1815,14 @@ static uint64_t evaluate_solution(const color_quad_i *pLow, const color_quad_i *
                                                 }
                                                 pixel_err[i] = (float)best_err;
                                                 total_errf += best_err;
+                                                if (total_errf > early_exit_threshold) return (uint64_t)total_errf;
                                                 pResults->m_pSelectors_temp[i] = best_sel;
                                         }
                                         goto n16_rgb_done;
                                 }
 #endif
                                 for (uint32_t i = 0; i < num_pixels; i++) {
-     if (dup_of[i] >= 0) { pResults->m_pSelectors_temp[i] = pResults->m_pSelectors_temp[dup_of[i]]; total_errf += pixel_err[dup_of[i]]; continue; }
+     if (dup_of[i] >= 0) { pResults->m_pSelectors_temp[i] = pResults->m_pSelectors_temp[dup_of[i]]; total_errf += pixel_err[dup_of[i]]; if (total_errf > early_exit_threshold) return (uint64_t)total_errf; continue; }
                                         const color_quad_i *pC = &pPixels[i];
                                         uint32_t best_err = UINT32_MAX;
                                         int best_sel = 0;
@@ -1702,14 +1835,69 @@ static uint64_t evaluate_solution(const color_quad_i *pLow, const color_quad_i *
                                         }
      pixel_err[i] = (float)best_err;
                                         total_errf += best_err;
+                                        if (total_errf > early_exit_threshold) return (uint64_t)total_errf;
                                         pResults->m_pSelectors_temp[i] = best_sel;
                                 }
                                 n16_rgb_done: ;
                         }
                         else if (N == 8)
                         {
+                                // =====================================================================
+                                // SSE2 FAST PATH: Integer LUT for N=8 RGB (Modes 1, 0, 3)
+                                // 8 selectors in one batch. Bit-exact with scalar when
+                                // wr==wg==wb==1.0f. Tie-breaking uses <= to match scalar
+                                // ispc_select chain (HIGHEST index wins on ties).
+                                // =====================================================================
+#if BC7E_HAVE_SSE2
+                                if (wr == 1.0f && wg == 1.0f && wb == 1.0f)
+                                {
+                                        uint8_t interp_r[8], interp_g[8], interp_b[8];
+                                        for (uint32_t s = 0; s < 8; s++) {
+                                                uint32_t w = pParams->m_pSelector_weights[s];
+                                                interp_r[s] = (uint8_t)(((64 - w) * actualMinColor.m_c[0] + w * actualMaxColor.m_c[0] + 32) >> 6);
+                                                interp_g[s] = (uint8_t)(((64 - w) * actualMinColor.m_c[1] + w * actualMaxColor.m_c[1] + 32) >> 6);
+                                                interp_b[s] = (uint8_t)(((64 - w) * actualMinColor.m_c[2] + w * actualMaxColor.m_c[2] + 32) >> 6);
+                                        }
+                                        const __m128i vr = _mm_setr_epi16(interp_r[0], interp_r[1], interp_r[2], interp_r[3], interp_r[4], interp_r[5], interp_r[6], interp_r[7]);
+                                        const __m128i vg = _mm_setr_epi16(interp_g[0], interp_g[1], interp_g[2], interp_g[3], interp_g[4], interp_g[5], interp_g[6], interp_g[7]);
+                                        const __m128i vb = _mm_setr_epi16(interp_b[0], interp_b[1], interp_b[2], interp_b[3], interp_b[4], interp_b[5], interp_b[6], interp_b[7]);
+                                        const __m128i zero = _mm_setzero_si128();
+                                        for (uint32_t i = 0; i < num_pixels; i++) {
+                                                if (dup_of[i] >= 0) { pResults->m_pSelectors_temp[i] = pResults->m_pSelectors_temp[dup_of[i]]; total_errf += pixel_err[dup_of[i]]; if (total_errf > early_exit_threshold) return (uint64_t)total_errf; continue; }
+                                                const color_quad_i *pC = &pPixels[i];
+                                                const __m128i vpr = _mm_set1_epi16((short)pC->m_c[0]);
+                                                const __m128i vpg = _mm_set1_epi16((short)pC->m_c[1]);
+                                                const __m128i vpb = _mm_set1_epi16((short)pC->m_c[2]);
+                                                __m128i dr = _mm_sub_epi16(vr, vpr);
+                                                __m128i dg = _mm_sub_epi16(vg, vpg);
+                                                __m128i db = _mm_sub_epi16(vb, vpb);
+                                                __m128i drdg_lo = _mm_unpacklo_epi16(dr, dg);
+                                                __m128i drdg_hi = _mm_unpackhi_epi16(dr, dg);
+                                                __m128i rd_lo = _mm_madd_epi16(drdg_lo, drdg_lo);
+                                                __m128i rd_hi = _mm_madd_epi16(drdg_hi, drdg_hi);
+                                                __m128i db2 = _mm_mullo_epi16(db, db);
+                                                __m128i db2_lo = _mm_unpacklo_epi16(db2, zero);
+                                                __m128i db2_hi = _mm_unpackhi_epi16(db2, zero);
+                                                __m128i err_lo = _mm_add_epi32(rd_lo, db2_lo);
+                                                __m128i err_hi = _mm_add_epi32(rd_hi, db2_hi);
+                                                uint32_t errs[8];
+                                                _mm_storeu_si128((__m128i*)&errs[0], err_lo);
+                                                _mm_storeu_si128((__m128i*)&errs[4], err_hi);
+                                                uint32_t best_err = UINT32_MAX;
+                                                int best_sel = 0;
+                                                for (int k = 0; k < 8; k++) {
+                                                        if (errs[k] <= best_err) { best_err = errs[k]; best_sel = k; }
+                                                }
+                                                pixel_err[i] = (float)best_err;
+                                                total_errf += best_err;
+                                                if (total_errf > early_exit_threshold) return (uint64_t)total_errf;
+                                                pResults->m_pSelectors_temp[i] = best_sel;
+                                        }
+                                        goto n8_rgb_done;
+                                }
+#endif
                                 for (uint32_t i = 0; i < num_pixels; i++) {
-     if (dup_of[i] >= 0) { pResults->m_pSelectors_temp[i] = pResults->m_pSelectors_temp[dup_of[i]]; total_errf += pixel_err[dup_of[i]]; continue; }
+     if (dup_of[i] >= 0) { pResults->m_pSelectors_temp[i] = pResults->m_pSelectors_temp[dup_of[i]]; total_errf += pixel_err[dup_of[i]]; if (total_errf > early_exit_threshold) return (uint64_t)total_errf; continue; }
                                         float pr = (float)pPixels[i].m_c[0]; float pg = (float)pPixels[i].m_c[1]; float pb = (float)pPixels[i].m_c[2];
                                         float best_err; int best_sel;
                                         {
@@ -1727,13 +1915,14 @@ static uint64_t evaluate_solution(const color_quad_i *pLow, const color_quad_i *
                                                 best_err = min(best_err, min(min(min(err0, err1), err2), err3)); best_sel = ispc_select(best_err == err0, 4, best_sel); best_sel = ispc_select(best_err == err1, 5, best_sel); best_sel = ispc_select(best_err == err2, 6, best_sel); best_sel = ispc_select(best_err == err3, 7, best_sel);
                                         }
      pixel_err[i] = (float)best_err;
-                                        total_errf += best_err; pResults->m_pSelectors_temp[i] = best_sel;
+                                        total_errf += best_err; if (total_errf > early_exit_threshold) return (uint64_t)total_errf; pResults->m_pSelectors_temp[i] = best_sel;
                                 }
+                                n8_rgb_done: ;
                         }
                         else // N == 4
                         {
                                 for (uint32_t i = 0; i < num_pixels; i++) {
-     if (dup_of[i] >= 0) { pResults->m_pSelectors_temp[i] = pResults->m_pSelectors_temp[dup_of[i]]; total_errf += pixel_err[dup_of[i]]; continue; }
+     if (dup_of[i] >= 0) { pResults->m_pSelectors_temp[i] = pResults->m_pSelectors_temp[dup_of[i]]; total_errf += pixel_err[dup_of[i]]; if (total_errf > early_exit_threshold) return (uint64_t)total_errf; continue; }
                                         float pr = (float)pPixels[i].m_c[0]; float pg = (float)pPixels[i].m_c[1]; float pb = (float)pPixels[i].m_c[2];
                                         float dr0 = weightedColors[0].m_c[0] - pr; float dg0 = weightedColors[0].m_c[1] - pg; float db0 = weightedColors[0].m_c[2] - pb; float err0 = wr * dr0 * dr0 + wg * dg0 * dg0 + wb * db0 * db0;
                                         float dr1 = weightedColors[1].m_c[0] - pr; float dg1 = weightedColors[1].m_c[1] - pg; float db1 = weightedColors[1].m_c[2] - pb; float err1 = wr * dr1 * dr1 + wg * dg1 * dg1 + wb * db1 * db1;
@@ -1741,7 +1930,7 @@ static uint64_t evaluate_solution(const color_quad_i *pLow, const color_quad_i *
                                         float dr3 = weightedColors[3].m_c[0] - pr; float dg3 = weightedColors[3].m_c[1] - pg; float db3 = weightedColors[3].m_c[2] - pb; float err3 = wr * dr3 * dr3 + wg * dg3 * dg3 + wb * db3 * db3;
                                         float best_err = min(min(min(err0, err1), err2), err3); int best_sel = ispc_select(best_err == err1, 1, 0); best_sel = ispc_select(best_err == err2, 2, best_sel); best_sel = ispc_select(best_err == err3, 3, best_sel);
      pixel_err[i] = (float)best_err;
-                                        total_errf += best_err; pResults->m_pSelectors_temp[i] = best_sel;
+                                        total_errf += best_err; if (total_errf > early_exit_threshold) return (uint64_t)total_errf; pResults->m_pSelectors_temp[i] = best_sel;
                                 }
                         }
                 }
@@ -1782,7 +1971,7 @@ static uint64_t evaluate_solution(const color_quad_i *pLow, const color_quad_i *
                                         const __m128i vas[2] = { va_lo, va_hi };
 
                                         for (uint32_t i = 0; i < num_pixels; i++) {
-                                                if (dup_of[i] >= 0) { pResults->m_pSelectors_temp[i] = pResults->m_pSelectors_temp[dup_of[i]]; total_errf += pixel_err[dup_of[i]]; continue; }
+                                                if (dup_of[i] >= 0) { pResults->m_pSelectors_temp[i] = pResults->m_pSelectors_temp[dup_of[i]]; total_errf += pixel_err[dup_of[i]]; if (total_errf > early_exit_threshold) return (uint64_t)total_errf; continue; }
                                                 const color_quad_i *pC = &pPixels[i];
                                                 const __m128i vpr = _mm_set1_epi16((short)pC->m_c[0]);
                                                 const __m128i vpg = _mm_set1_epi16((short)pC->m_c[1]);
@@ -1822,13 +2011,14 @@ static uint64_t evaluate_solution(const color_quad_i *pLow, const color_quad_i *
                                                 }
                                                 pixel_err[i] = (float)best_err;
                                                 total_errf += best_err;
+                                                if (total_errf > early_exit_threshold) return (uint64_t)total_errf;
                                                 pResults->m_pSelectors_temp[i] = best_sel;
                                         }
                                         goto n16_rgba_done;
                                 }
 #endif
                                 for (uint32_t i = 0; i < num_pixels; i++) {
-     if (dup_of[i] >= 0) { pResults->m_pSelectors_temp[i] = pResults->m_pSelectors_temp[dup_of[i]]; total_errf += pixel_err[dup_of[i]]; continue; }
+     if (dup_of[i] >= 0) { pResults->m_pSelectors_temp[i] = pResults->m_pSelectors_temp[dup_of[i]]; total_errf += pixel_err[dup_of[i]]; if (total_errf > early_exit_threshold) return (uint64_t)total_errf; continue; }
                                         const color_quad_i *pC = &pPixels[i];
                                         uint32_t best_err = UINT32_MAX;
                                         int best_sel = 0;
@@ -1842,14 +2032,73 @@ static uint64_t evaluate_solution(const color_quad_i *pLow, const color_quad_i *
                                         }
      pixel_err[i] = (float)best_err;
                                         total_errf += best_err;
+                                        if (total_errf > early_exit_threshold) return (uint64_t)total_errf;
                                         pResults->m_pSelectors_temp[i] = best_sel;
                                 }
                                 n16_rgba_done: ;
                         }
                         else if (N == 8)
                         {
+                                // =====================================================================
+                                // SSE2 FAST PATH: Integer LUT for N=8 RGBA (Mode 7 alpha blocks)
+                                // 8 selectors in one batch. Bit-exact with scalar when
+                                // wr==wg==wb==wa==1.0f. Tie-breaking uses <= to match scalar
+                                // ispc_select chain (HIGHEST index wins on ties).
+                                // =====================================================================
+#if BC7E_HAVE_SSE2
+                                if (wr == 1.0f && wg == 1.0f && wb == 1.0f && wa == 1.0f)
+                                {
+                                        uint8_t interp_r[8], interp_g[8], interp_b[8], interp_a[8];
+                                        for (uint32_t s = 0; s < 8; s++) {
+                                                uint32_t w = pParams->m_pSelector_weights[s];
+                                                interp_r[s] = (uint8_t)(((64 - w) * actualMinColor.m_c[0] + w * actualMaxColor.m_c[0] + 32) >> 6);
+                                                interp_g[s] = (uint8_t)(((64 - w) * actualMinColor.m_c[1] + w * actualMaxColor.m_c[1] + 32) >> 6);
+                                                interp_b[s] = (uint8_t)(((64 - w) * actualMinColor.m_c[2] + w * actualMaxColor.m_c[2] + 32) >> 6);
+                                                interp_a[s] = (uint8_t)(((64 - w) * actualMinColor.m_c[3] + w * actualMaxColor.m_c[3] + 32) >> 6);
+                                        }
+                                        const __m128i vr = _mm_setr_epi16(interp_r[0], interp_r[1], interp_r[2], interp_r[3], interp_r[4], interp_r[5], interp_r[6], interp_r[7]);
+                                        const __m128i vg = _mm_setr_epi16(interp_g[0], interp_g[1], interp_g[2], interp_g[3], interp_g[4], interp_g[5], interp_g[6], interp_g[7]);
+                                        const __m128i vb = _mm_setr_epi16(interp_b[0], interp_b[1], interp_b[2], interp_b[3], interp_b[4], interp_b[5], interp_b[6], interp_b[7]);
+                                        const __m128i va = _mm_setr_epi16(interp_a[0], interp_a[1], interp_a[2], interp_a[3], interp_a[4], interp_a[5], interp_a[6], interp_a[7]);
+                                        for (uint32_t i = 0; i < num_pixels; i++) {
+                                                if (dup_of[i] >= 0) { pResults->m_pSelectors_temp[i] = pResults->m_pSelectors_temp[dup_of[i]]; total_errf += pixel_err[dup_of[i]]; if (total_errf > early_exit_threshold) return (uint64_t)total_errf; continue; }
+                                                const color_quad_i *pC = &pPixels[i];
+                                                const __m128i vpr = _mm_set1_epi16((short)pC->m_c[0]);
+                                                const __m128i vpg = _mm_set1_epi16((short)pC->m_c[1]);
+                                                const __m128i vpb = _mm_set1_epi16((short)pC->m_c[2]);
+                                                const __m128i vpa = _mm_set1_epi16((short)pC->m_c[3]);
+                                                __m128i dr = _mm_sub_epi16(vr, vpr);
+                                                __m128i dg = _mm_sub_epi16(vg, vpg);
+                                                __m128i db = _mm_sub_epi16(vb, vpb);
+                                                __m128i da = _mm_sub_epi16(va, vpa);
+                                                __m128i drdg_lo = _mm_unpacklo_epi16(dr, dg);
+                                                __m128i drdg_hi = _mm_unpackhi_epi16(dr, dg);
+                                                __m128i rd_lo = _mm_madd_epi16(drdg_lo, drdg_lo);
+                                                __m128i rd_hi = _mm_madd_epi16(drdg_hi, drdg_hi);
+                                                __m128i dbda_lo = _mm_unpacklo_epi16(db, da);
+                                                __m128i dbda_hi = _mm_unpackhi_epi16(db, da);
+                                                __m128i bd_lo = _mm_madd_epi16(dbda_lo, dbda_lo);
+                                                __m128i bd_hi = _mm_madd_epi16(dbda_hi, dbda_hi);
+                                                __m128i err_lo = _mm_add_epi32(rd_lo, bd_lo);
+                                                __m128i err_hi = _mm_add_epi32(rd_hi, bd_hi);
+                                                uint32_t errs[8];
+                                                _mm_storeu_si128((__m128i*)&errs[0], err_lo);
+                                                _mm_storeu_si128((__m128i*)&errs[4], err_hi);
+                                                uint32_t best_err = UINT32_MAX;
+                                                int best_sel = 0;
+                                                for (int k = 0; k < 8; k++) {
+                                                        if (errs[k] <= best_err) { best_err = errs[k]; best_sel = k; }
+                                                }
+                                                pixel_err[i] = (float)best_err;
+                                                total_errf += best_err;
+                                                if (total_errf > early_exit_threshold) return (uint64_t)total_errf;
+                                                pResults->m_pSelectors_temp[i] = best_sel;
+                                        }
+                                        goto n8_rgba_done;
+                                }
+#endif
                                 for (uint32_t i = 0; i < num_pixels; i++) {
-     if (dup_of[i] >= 0) { pResults->m_pSelectors_temp[i] = pResults->m_pSelectors_temp[dup_of[i]]; total_errf += pixel_err[dup_of[i]]; continue; }
+     if (dup_of[i] >= 0) { pResults->m_pSelectors_temp[i] = pResults->m_pSelectors_temp[dup_of[i]]; total_errf += pixel_err[dup_of[i]]; if (total_errf > early_exit_threshold) return (uint64_t)total_errf; continue; }
                                         float pr = (float)pPixels[i].m_c[0]; float pg = (float)pPixels[i].m_c[1]; float pb = (float)pPixels[i].m_c[2]; float pa = (float)pPixels[i].m_c[3];
                                         float best_err; int best_sel;
                                         {
@@ -1867,13 +2116,14 @@ static uint64_t evaluate_solution(const color_quad_i *pLow, const color_quad_i *
                                                 best_err = min(best_err, min(min(min(err0, err1), err2), err3)); best_sel = ispc_select(best_err == err0, 4, best_sel); best_sel = ispc_select(best_err == err1, 5, best_sel); best_sel = ispc_select(best_err == err2, 6, best_sel); best_sel = ispc_select(best_err == err3, 7, best_sel);
                                         }
      pixel_err[i] = (float)best_err;
-                                        total_errf += best_err; pResults->m_pSelectors_temp[i] = best_sel;
+                                        total_errf += best_err; if (total_errf > early_exit_threshold) return (uint64_t)total_errf; pResults->m_pSelectors_temp[i] = best_sel;
                                 }
+                                n8_rgba_done: ;
                         }
                         else // N == 4
                         {
                                 for (uint32_t i = 0; i < num_pixels; i++) {
-     if (dup_of[i] >= 0) { pResults->m_pSelectors_temp[i] = pResults->m_pSelectors_temp[dup_of[i]]; total_errf += pixel_err[dup_of[i]]; continue; }
+     if (dup_of[i] >= 0) { pResults->m_pSelectors_temp[i] = pResults->m_pSelectors_temp[dup_of[i]]; total_errf += pixel_err[dup_of[i]]; if (total_errf > early_exit_threshold) return (uint64_t)total_errf; continue; }
                                         float pr = (float)pPixels[i].m_c[0]; float pg = (float)pPixels[i].m_c[1]; float pb = (float)pPixels[i].m_c[2]; float pa = (float)pPixels[i].m_c[3];
                                         float dr0 = weightedColors[0].m_c[0] - pr; float dg0 = weightedColors[0].m_c[1] - pg; float db0 = weightedColors[0].m_c[2] - pb; float da0 = weightedColors[0].m_c[3] - pa; float err0 = wr * dr0 * dr0 + wg * dg0 * dg0 + wb * db0 * db0 + wa * da0 * da0;
                                         float dr1 = weightedColors[1].m_c[0] - pr; float dg1 = weightedColors[1].m_c[1] - pg; float db1 = weightedColors[1].m_c[2] - pb; float da1 = weightedColors[1].m_c[3] - pa; float err1 = wr * dr1 * dr1 + wg * dg1 * dg1 + wb * db1 * db1 + wa * da1 * da1;
@@ -1881,7 +2131,7 @@ static uint64_t evaluate_solution(const color_quad_i *pLow, const color_quad_i *
                                         float dr3 = weightedColors[3].m_c[0] - pr; float dg3 = weightedColors[3].m_c[1] - pg; float db3 = weightedColors[3].m_c[2] - pb; float da3 = weightedColors[3].m_c[3] - pa; float err3 = wr * dr3 * dr3 + wg * dg3 * dg3 + wb * db3 * db3 + wa * da3 * da3;
                                         float best_err = min(min(min(err0, err1), err2), err3); int best_sel = ispc_select(best_err == err1, 1, 0); best_sel = ispc_select(best_err == err2, 2, best_sel); best_sel = ispc_select(best_err == err3, 3, best_sel);
      pixel_err[i] = (float)best_err;
-                                        total_errf += best_err; pResults->m_pSelectors_temp[i] = best_sel;
+                                        total_errf += best_err; if (total_errf > early_exit_threshold) return (uint64_t)total_errf; pResults->m_pSelectors_temp[i] = best_sel;
                                 }
                         }
                 }
@@ -1897,7 +2147,7 @@ static uint64_t evaluate_solution(const color_quad_i *pLow, const color_quad_i *
                 }
                 if (pParams->m_has_alpha) {
                         for (uint32_t i = 0; i < num_pixels; i++) {
-    if (dup_of[i] >= 0) { pResults->m_pSelectors_temp[i] = pResults->m_pSelectors_temp[dup_of[i]]; total_errf += pixel_err[dup_of[i]]; continue; }
+    if (dup_of[i] >= 0) { pResults->m_pSelectors_temp[i] = pResults->m_pSelectors_temp[dup_of[i]]; total_errf += pixel_err[dup_of[i]]; if (total_errf > early_exit_threshold) return (uint64_t)total_errf; continue; }
                                 float r = pPixels[i].m_c[0]; float g = pPixels[i].m_c[1]; float b = pPixels[i].m_c[2]; float a = pPixels[i].m_c[3];
                                 float y = r * .2126f + g * .7152f + b * .0722f; float cr = r - y; float cb = b - y;
                                 // GLOW FIX: Premultiplied alpha error weighting.
@@ -1915,11 +2165,11 @@ static uint64_t evaluate_solution(const color_quad_i *pLow, const color_quad_i *
                                         if (err < best_err) { best_err = err; best_sel = j; }
                                 }
     pixel_err[i] = (float)best_err;
-                                total_errf += best_err; pResults->m_pSelectors_temp[i] = best_sel;
+                                total_errf += best_err; if (total_errf > early_exit_threshold) return (uint64_t)total_errf; pResults->m_pSelectors_temp[i] = best_sel;
                         }
                 } else {
                         for (uint32_t i = 0; i < num_pixels; i++) {
-    if (dup_of[i] >= 0) { pResults->m_pSelectors_temp[i] = pResults->m_pSelectors_temp[dup_of[i]]; total_errf += pixel_err[dup_of[i]]; continue; }
+    if (dup_of[i] >= 0) { pResults->m_pSelectors_temp[i] = pResults->m_pSelectors_temp[dup_of[i]]; total_errf += pixel_err[dup_of[i]]; if (total_errf > early_exit_threshold) return (uint64_t)total_errf; continue; }
                                 float r = pPixels[i].m_c[0]; float g = pPixels[i].m_c[1]; float b = pPixels[i].m_c[2];
                                 float y = r * .2126f + g * .7152f + b * .0722f; float cr = r - y; float cb = b - y;
                                 float best_err = 1e+10f; int32_t best_sel;
@@ -1929,7 +2179,7 @@ static uint64_t evaluate_solution(const color_quad_i *pLow, const color_quad_i *
                                         if (err < best_err) { best_err = err; best_sel = j; }
                                 }
     pixel_err[i] = (float)best_err;
-                                total_errf += best_err; pResults->m_pSelectors_temp[i] = best_sel;
+                                total_errf += best_err; if (total_errf > early_exit_threshold) return (uint64_t)total_errf; pResults->m_pSelectors_temp[i] = best_sel;
                         }
                 }
         }
@@ -2340,7 +2590,7 @@ static uint64_t find_optimal_solution( uint32_t mode,  vec4F * pXl,  vec4F * pXh
 
 // Note: In mode 6, m_has_alpha will only be true for transparent blocks.
 static uint64_t color_cell_compression( uint32_t mode, const  color_cell_compressor_params * pParams,  color_cell_compressor_results * pResults, 
-                const  bc7e_compress_block_params * pComp_params, uint32_t num_pixels, const  color_quad_i * pPixels,  bool refinement)
+                const  bc7e_compress_block_params * pComp_params, uint32_t num_pixels, const  color_quad_i * pPixels,  bool refinement, uint64_t target_err_to_beat = UINT64_MAX)
 {
                 pResults->m_best_overall_err = UINT64_MAX;
 
@@ -2412,6 +2662,7 @@ static uint64_t color_cell_compression( uint32_t mode, const  color_cell_compres
                 meanColor = vec4F_mul(&meanColor, 1.0f / (float)((int)num_pixels * 255.0f));
                 vec4F_saturate_in_place(&meanColor);
 
+                float pca_lower_bound = -1.0f;  // -1 = not computed (alpha path)
                 if (pParams->m_has_alpha)
                 {
                                 vec4F v;
@@ -2504,6 +2755,37 @@ static uint64_t color_cell_compression( uint32_t mode, const  color_cell_compres
                                                 vfg *= len;
                                                 vfb *= len;
                                                 vec4F_set(&axis, vfr, vfg, vfb, 0);
+                                                // EXACT eigenvalue-based lower bound on minimum SSE for any line.
+                                                // min_SSE = trace(cov) - max_eigenvalue(cov)
+                                                // Computed analytically (trigonometric method for 3x3 symmetric matrix).
+                                                // Provably lossless: exact max eigenvalue, no power iteration approximation.
+                                                { const float a=cov[0], b=cov[1], c=cov[2], d=cov[3], e=cov[4], f=cov[5];
+                                                  const float tr = a + d + f;
+                                                  const float p1 = b*b + c*c + e*e;
+                                                  if (p1 < 1e-10f) {
+                                                    // Diagonal matrix: eigenvalues are the diagonal elements
+                                                    pca_lower_bound = tr - maximumf(maximumf(a, d), f);
+                                                  } else {
+                                                    const float q = tr / 3.0f;
+                                                    const float p2 = (a-q)*(a-q) + (d-q)*(d-q) + (f-q)*(f-q) + 2.0f*p1;
+                                                    const float p = sqrtf(p2 / 6.0f);
+                                                    if (p > 1e-10f) {
+                                                      // B = (cov - q*I) / p
+                                                      const float Ba=(a-q)/p, Bd=(d-q)/p, Bf=(f-q)/p, Bb=b/p, Bc=c/p, Be=e/p;
+                                                      // det(B) for 3x3 symmetric
+                                                      const float detB = Ba*(Bd*Bf - Be*Be) - Bb*(Bb*Bf - Be*Bc) + Bc*(Bb*Be - Bd*Bc);
+                                                      float r = detB / 2.0f;
+                                                      if (r < -1.0f) r = -1.0f; if (r > 1.0f) r = 1.0f;
+                                                      const float phi = acosf(r) / 3.0f;
+                                                      // Largest eigenvalue: e1 = q + 2p*cos(phi)
+                                                      const float max_eig = q + 2.0f * p * cosf(phi);
+                                                      pca_lower_bound = tr - max_eig;
+                                                    } else {
+                                                      pca_lower_bound = 0.0f;  // Near-zero variance
+                                                    }
+                                                  }
+                                                  if (pca_lower_bound < 0.0f) pca_lower_bound = 0.0f;
+                                                }
                                 }
                 }
 
@@ -2548,13 +2830,26 @@ static uint64_t color_cell_compression( uint32_t mode, const  color_cell_compres
                                 maxColor = temp;
                 }
 
+                // MAJOR LOSSLESS SPEEDUP: Exact eigenvalue lower-bound pruning.
+                // pca_lower_bound = trace(cov) - max_eigenvalue = minimum SSE for any line.
+                // BC7's SSE >= this bound. If bound > target + margin, skip everything.
+                // Margin 2.0 accounts for float32 rounding (max error < 0.1 at this scale).
+                if (target_err_to_beat != UINT64_MAX && pca_lower_bound >= 0.0f)
+                {
+                                if (pca_lower_bound > (float)target_err_to_beat + 2.0f)
+                                {
+                                                pResults->m_best_overall_err = target_err_to_beat;
+                                                return target_err_to_beat;
+                                }
+                }
+
                 if (!find_optimal_solution(mode, &minColor, &maxColor, pParams, pResults, pComp_params->m_pbit_search, num_pixels, pPixels, dup_of_cc))
                                 return 0;
 
                 // SKIP REFINEMENT IF ALREADY PERFECT OR NEAR-PERFECT
                 // If the initial PCA nailed it, don't waste time on refinement.
                 if (!refinement || pResults->m_best_overall_err == 0)
-                        return pResults->m_best_overall_err;
+                                return pResults->m_best_overall_err;
 
                 // For very low error blocks, skip expensive uber refinement
                 // (saves the 7 extra find_optimal_solution calls in uber_level > 0)
@@ -2619,8 +2914,11 @@ static uint64_t color_cell_compression( uint32_t mode, const  color_cell_compres
                                 vec4F_set_scalar(&xl, 0.0f);
                                 vec4F_set_scalar(&xh, 0.0f);
 
-                                if (pComp_params->m_uber1_mask & 1)
+                                if ((pComp_params->m_uber1_mask & 1) && (min_sel < (pParams->m_num_selector_weights - 1)))
                                 {
+                                                // LOSSLESS: When min_sel == max_selector, NO pixel satisfies
+                                                // (sel == min_sel AND sel < max_selector), so mask 1 is a no-op.
+                                                // Skip the entire LSQ + find_optimal_solution call.
                                                 for ( uint32_t i = 0; i < num_pixels; i++)
                                                 {
                                                                 uint32_t sel = selectors_temp[i];
@@ -2645,8 +2943,11 @@ static uint64_t color_cell_compression( uint32_t mode, const  color_cell_compres
                                                                 return 0;
                                 }
 
-                                if (pComp_params->m_uber1_mask & 2)
+                                if ((pComp_params->m_uber1_mask & 2) && (max_sel > 0))
                                 {
+                                                // LOSSLESS: When max_sel == 0, NO pixel satisfies
+                                                // (sel == max_sel AND sel > 0), so mask 2 is a no-op.
+                                                // Skip the entire LSQ + find_optimal_solution call.
                                                 for ( uint32_t i = 0; i < num_pixels; i++)
                                                 {
                                                                 uint32_t sel = selectors_temp[i];
@@ -2671,8 +2972,13 @@ static uint64_t color_cell_compression( uint32_t mode, const  color_cell_compres
                                                                 return 0;
                                 }
 
-                                if (pComp_params->m_uber1_mask & 4)
+                                if ((pComp_params->m_uber1_mask & 4) && (min_sel < (pParams->m_num_selector_weights - 1) || max_sel > 0))
                                 {
+                                                // LOSSLESS: When min_sel == max_selector, mask 4 reduces to
+                                                // mask 2 (already ran). When max_sel == 0, mask 4 reduces to
+                                                // mask 1 (already ran). In both cases, LSQ endpoints and
+                                                // find_optimal_solution results are identical to the mask
+                                                // that already ran, so evaluate_solution would be skipped.
                                                 for ( uint32_t i = 0; i < num_pixels; i++)
                                                 {
                                                                 uint32_t sel = selectors_temp[i];
@@ -2703,6 +3009,14 @@ static uint64_t color_cell_compression( uint32_t mode, const  color_cell_compres
                                 if ((pComp_params->m_uber_level >= 2) && (pResults->m_best_overall_err > uber_err_thresh))
                                 {
                                                 const  int Q = (pComp_params->m_uber_level >= 4) ? (pComp_params->m_uber_level - 2) : 1;
+                                                // LOSSLESS Q-LOOP DEDUP: Track selector-array hashes to skip
+                                                // iterations producing identical selectors to a previously-tried
+                                                // iteration. Two identical selector arrays produce identical
+                                                // LSQ endpoints and identical find_optimal_solution results,
+                                                // so the duplicate is a provable no-op.
+                                                // 16 selectors x 4 bits = 64 bits = exact hash (no collisions).
+                                                uint64_t tried_hashes[16];
+                                                uint32_t num_tried = 0;
                                                 for ( int ly = -Q; ly <= 1; ly++)
                                                 {
                                                                 for ( int hy = max_selector - 1; hy <= (max_selector + Q); hy++)
@@ -2712,6 +3026,19 @@ static uint64_t color_cell_compression( uint32_t mode, const  color_cell_compres
 
                                                                                 for ( uint32_t i = 0; i < num_pixels; i++)
                                                                                                 selectors_temp1[i] = (int)clampf(floor((float)max_selector * ((float)(int)selectors_temp[i] - (float)ly) / ((float)hy - (float)ly) + .5f), 0, (float)max_selector);
+
+                                                                                // Compute exact 64-bit hash of selectors_temp1
+                                                                                uint64_t new_hash = 0;
+                                                                                for ( uint32_t i = 0; i < num_pixels; i++)
+                                                                                                new_hash = (new_hash << 4) | (uint64_t)(selectors_temp1[i] & 0xF);
+
+                                                                                // Skip if duplicate of a previously-tried iteration
+                                                                                bool is_dup = false;
+                                                                                for (uint32_t j = 0; j < num_tried; j++) {
+                                                                                                if (tried_hashes[j] == new_hash) { is_dup = true; break; }
+                                                                                }
+                                                                                if (is_dup) continue;
+                                                                                tried_hashes[num_tried++] = new_hash;
 
                                                                                 vec4F_set_scalar(&xl, 0.0f);
                                                                                 vec4F_set_scalar(&xh, 0.0f);
@@ -3189,16 +3516,33 @@ static uint32_t estimate_partition( uint32_t mode, const  color_quad_i * pPixels
 
                                 uint64_t total_subset_err = 0;
 
-                                for ( uint32_t subset = 0; subset < total_subsets; subset++)
+                                // LOSSLESS SPEEDUP: Evaluate subsets largest-first
+                                // and use a TIGHTER early-exit threshold (best_err -
+                                // total_subset_err) so color_cell_compression_est exits
+                                // sooner within each subset. Also break out of the subset
+                                // loop as soon as the partition is provably worse than
+                                // best_err. Same result, fewer wasted cycles on bad partitions.
+                                uint32_t subset_order[3] = { 0, 1, 2 };
+                                if (total_subsets >= 2) {
+                                        if (subset_total_colors[subset_order[0]] < subset_total_colors[subset_order[1]]) { uint32_t t = subset_order[0]; subset_order[0] = subset_order[1]; subset_order[1] = t; }
+                                }
+                                if (total_subsets >= 3) {
+                                        if (subset_total_colors[subset_order[1]] < subset_total_colors[subset_order[2]]) { uint32_t t = subset_order[1]; subset_order[1] = subset_order[2]; subset_order[2] = t; }
+                                        if (subset_total_colors[subset_order[0]] < subset_total_colors[subset_order[1]]) { uint32_t t = subset_order[0]; subset_order[0] = subset_order[1]; subset_order[1] = t; }
+                                }
+
+                                for ( uint32_t s = 0; s < total_subsets; s++)
                                 {
+                                                const uint32_t subset = subset_order[s];
+                                                const uint64_t remaining_budget = best_err - total_subset_err;
                                                 uint64_t err;
                                                 if (mode == 7)
-                                                                err = color_cell_compression_est_mode7(mode, &params, best_err, subset_total_colors[subset], &subset_colors[subset][0]);
+                                                                err = color_cell_compression_est_mode7(mode, &params, remaining_budget, subset_total_colors[subset], &subset_colors[subset][0]);
                                                 else
-                                                                err = color_cell_compression_est(mode, &params, best_err, subset_total_colors[subset], &subset_colors[subset][0]);
+                                                                err = color_cell_compression_est(mode, &params, remaining_budget, subset_total_colors[subset], &subset_colors[subset][0]);
 
                                                 total_subset_err += err;
-
+                                                if (total_subset_err >= best_err) break; // LOSSLESS: partition provably worse
                                 } // subset
 
                                 if (total_subset_err < best_err)
@@ -4563,7 +4907,7 @@ static void handle_alpha_block(void * pBlock, const  color_quad_i * pPixels, con
         // better R/B precision than Mode 5/7's 4 selectors — preserving the
         // R/B PSNR gains from Fix I (Mode 6 expansion).
         const bool outline_high_green = outline_alpha_block && (color_range_g > 48);
-        if (pComp_params->m_alpha_settings.m_use_mode6 && !bimodal_alpha && !outline_high_green)
+        if (pComp_params->m_alpha_settings.m_use_mode6 && (pComp_params->m_force_single_mode || (!bimodal_alpha && !outline_high_green)) && best_err > 0)
         {
                  color_cell_compressor_params params6 = *pParams;
                 params6.m_weights[0] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[0];
@@ -4640,7 +4984,7 @@ static void handle_alpha_block(void * pBlock, const  color_quad_i * pPixels, con
         }
 
         // Mode 5
-        if (pComp_params->m_alpha_settings.m_use_mode5)
+        if (pComp_params->m_alpha_settings.m_use_mode5 && best_err > 0)
         {
                 // OPT-C (speed): max_color_range_m5 is the SAME value as the
                 // max_color_range already computed above (from lo_r/hi_r/etc.
@@ -4653,7 +4997,10 @@ static void handle_alpha_block(void * pBlock, const  color_quad_i * pPixels, con
                 // color range > 128. See outline_alpha_block definition above.
                 // Mode 5's 7-bit RGB + 8-bit A endpoints have 4x the precision of
                 // Mode 7's 5-bit and win for these blocks.
-                if (outline_alpha_block || max_color_range_m5 < 128)
+                // m_force_single_mode: when re-encoding a block in Mode 5 only
+                // (M7TO5 fallback), bypass the range guard so high-contrast
+                // blocks still get a valid Mode 5 encode.
+                if (pComp_params->m_force_single_mode || outline_alpha_block || max_color_range_m5 < 128)
                 {
                         color_cell_compressor_params params5 = *pParams;
                         const  int num_rotations = (pComp_params->m_perceptual || (!pComp_params->m_alpha_settings.m_use_mode5_rotation)) ? 2 : 4;
@@ -4719,7 +5066,7 @@ static void handle_alpha_block(void * pBlock, const  color_quad_i * pPixels, con
         // well below visual lossless. This saves ~24 est() calls + 8-16
         // color_cell_compression(7) calls per skipped block.
         const bool mode7_early_skip = (best_err < 32) && !bimodal_alpha && !outline_alpha_block;
-        if (pComp_params->m_alpha_settings.m_use_mode7 && (!skip_mode7 || bimodal_alpha || need_mode7_fallback) && !mode7_early_skip)
+        if (pComp_params->m_alpha_settings.m_use_mode7 && (!skip_mode7 || bimodal_alpha || need_mode7_fallback) && !mode7_early_skip && best_err > 0)
         {
                 solution solutions[BC7E_MAX_PARTITIONS7];
                 uint32_t parts_to_try = pComp_params->m_alpha_settings.m_max_mode7_partitions_to_try;
@@ -4787,9 +5134,16 @@ static void handle_alpha_block(void * pBlock, const  color_quad_i * pPixels, con
                                 subset_pixel_index7[p][subset_total_colors7[p]] = idx;
                                 subset_total_colors7[p]++;
                         }
+                        // LOSSLESS SPEEDUP: Process larger subset first (see Mode 1).
+                        const uint32_t subset_order7[2] = {
+                                (subset_total_colors7[1] > subset_total_colors7[0]) ? 1u : 0u,
+                                (subset_total_colors7[1] > subset_total_colors7[0]) ? 0u : 1u
+                        };
+
                         uint64_t trial_err = 0;
-                        for ( uint32_t subset = 0; subset < 2; subset++)
+                        for ( uint32_t s = 0; s < 2; s++)
                         {
+                                const uint32_t subset = subset_order7[s];
                                 color_cell_compressor_results * pResults = &subset_results7[subset];
                                 pResults->m_pSelectors = &subset_selectors7[subset][0];
                                 pResults->m_pSelectors_temp = selectors_temp;
@@ -4866,9 +5220,15 @@ static void handle_alpha_block(void * pBlock, const  color_quad_i * pPixels, con
                                 subset_pixel_index7[p][subset_total_colors7[p]] = idx;
                                 subset_total_colors7[p]++;
                         }
+                        const uint32_t subset_order7[2] = {
+                                (subset_total_colors7[1] > subset_total_colors7[0]) ? 1u : 0u,
+                                (subset_total_colors7[1] > subset_total_colors7[0]) ? 0u : 1u
+                        };
+
                         uint64_t trial_err = 0;
-                        for ( uint32_t subset = 0; subset < 2; subset++)
+                        for ( uint32_t s = 0; s < 2; s++)
                         {
+                                const uint32_t subset = subset_order7[s];
                                 color_cell_compressor_results * pResults = &subset_results7[subset];
                                 pResults->m_pSelectors = &subset_selectors7[subset][0];
                                 pResults->m_pSelectors_temp = selectors_temp;
@@ -4906,27 +5266,10 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
                 bc7_optimization_results opt_results;
                                 
                 uint64_t best_err = UINT64_MAX;
-                uint64_t best_non_3subset_err = UINT64_MAX;  // Track best non-3-subset error
-
-                // QuickBC7 mode pruning: skip multi-subset modes for simple blocks.
-                // Luma range and distinct color count determine which modes are worth trying.
                 const int luma_range = pStats->max_luma - pStats->min_luma;
                 const int ndc = pStats->num_distinct_colors;
-
-                // Existing logic for skipping multi-subset entirely
                 const bool skip_multisubset = (ndc <= 3) || (luma_range <= 8 && pStats->luma_var < 64);
-
-                // NEW: Only try heavy 3-subset modes (0 and 2) if the block actually has complex details.
-                // High distinct color count or high variance indicates fine details/edges.
                 const bool try_3_subset = (ndc >= 6) || (pStats->luma_var > 250);
-
-                // NOTE: Fix I (block-adaptive alpha boost) is intentionally NOT
-                // applied to opaque blocks. Opaque blocks have alpha=255 (range=0),
-                // so dom_c can only be R/G/B. Testing showed RGB boosts in opaque
-                // blocks cause B regression (max B 53->110) by shifting mode
-                // selection (e.g. Mode 5 winning over Mode 6). Mode 6 (1-subset,
-                // 8-bit endpoints, 16 selectors) is already optimal for most opaque
-                // blocks, and the existing partition estimator picks the right mode.
 
                 // Mode 6
                 if (pComp_params->m_opaque_settings.m_use_mode[6])
@@ -4946,7 +5289,6 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
                                 results6.m_pSelectors_temp = selectors_temp;
 
                                 best_err = color_cell_compression(6, pParams, &results6, pComp_params, 16, pPixels, true);
-                                best_non_3subset_err = best_err;
                                                                                                 
                                 opt_results.m_mode = 6;
                                 opt_results.m_index_selector = 0;
@@ -4960,45 +5302,36 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
                                 opt_results.m_pbits[0][1] = results6.m_pbits[1];
                 }
 
-        const uint32_t MAX_MODE13_ADAPTIVE = 8; 
+        const uint32_t MAX_MODE13_ADAPTIVE = 8;
         solution solutions2[MAX_MODE13_ADAPTIVE];
         uint32_t num_solutions2 = 0;
         
-        if (pComp_params->m_opaque_settings.m_use_mode[1] || pComp_params->m_opaque_settings.m_use_mode[3])
+        if (pComp_params->m_opaque_settings.m_use_mode[1] && best_err > 112)
         {
-                // ==========================================
-                // THE "MODE STEALING" PREVENTION TRICK
-                // If there are more than 3 colors, a 2-subset mode CANNOT 
-                // win without looking blocky. Intentionally cripple it 
-                // so the 3-subset modes (0 and 2) are forced to handle it.
-                // ==========================================
-                uint32_t dynamic_parts_13 = 8; // Default for normal images
+                // Bypass heavy estimate_partition_list pre-filtering
+                // estimate_partition_list evaluates all 64 partitions and runs expensive 
+                // float math on the top candidates. This is the primary 50% time sink.
+                // Instead, we use the highly optimized integer-based quick estimator, 
+                // plus the historically strong checkerboard partition.
 
-                if (pStats->num_distinct_colors > 3) {
-                        // Force 2-subset modes to fail fast.
-                        // Just check the absolute basic shapes to prove it's a bad fit.
-                        dynamic_parts_13 = 3; 
-                }
-                else if (pStats->luma_var < 1000) {
-                        dynamic_parts_13 = 4; 
-                }
-                
-                if (pComp_params->m_opaque_settings.m_max_mode13_partitions_to_try == 1)
+                // Add checkerboard partition (34) as a fallback. It handles diagonal splits 
+                // that PCA-based estimators sometimes miss, preventing the "intersection artifacts" 
+                // you noticed when removing this block entirely.
+                if (pComp_params->m_opaque_settings.m_max_mode13_partitions_to_try > 1)
                 {
+                        uint32_t dynamic_parts_13 = (pStats->num_distinct_colors > 3) ? 1 : 2;
+                        num_solutions2 = estimate_partition_list(1, pPixels, pComp_params, solutions2, dynamic_parts_13);
+                } else {
                         solutions2[0].m_index = quick_estimate_partition_2subset(pPixels, pStats, pComp_params);
                         num_solutions2 = 1;
                 }
-                else
-                {
-                        num_solutions2 = estimate_partition_list(1, pPixels, pComp_params, solutions2, dynamic_parts_13);
-                }
-                // ==========================================
         }
                                 
                 const  bool disable_faster_part_selection = false;
                                                                                                                                 
                 // Mode 1 (2-subset, 6-bit color, 3-bit indices)
-                if (pComp_params->m_opaque_settings.m_use_mode[1] && !skip_multisubset)
+                // best_err > 0: if Mode 6 already gave perfect reconstruction, skip (zero quality loss).
+                if (pComp_params->m_opaque_settings.m_use_mode[1] && !skip_multisubset && best_err > 0)
                 {
                                 pParams->m_pSelector_weights = g_bc7_weights3;
                                 pParams->m_pSelector_weightsx = (const vec4F *)&g_bc7_weights3x[0];
@@ -5041,27 +5374,40 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
                                                                 subset_total_colors1[p]++;
                                                 }
                                                                                                                                 
+                                                // LOSSLESS SPEEDUP: Process the LARGER subset first.
+                                                // More pixels = higher accumulated error = more likely to
+                                                // trigger early-exit after the first subset (errors are
+                                                // non-negative, so if partial > best_err then total >
+                                                // best_err). Skips the 2nd color_cell_compression call
+                                                // entirely on blocks where Mode 1 can't win.
+                                                const uint32_t subset_order1[2] = {
+                                                                (subset_total_colors1[1] > subset_total_colors1[0]) ? 1u : 0u,
+                                                                (subset_total_colors1[1] > subset_total_colors1[0]) ? 0u : 1u
+                                                };
+
                                                 uint64_t trial_err = 0;
-                                                for ( uint32_t subset = 0; subset < 2; subset++)
+                                                for ( uint32_t s = 0; s < 2; s++)
                                                 {
+                                                                const uint32_t subset = subset_order1[s];
                                                                  color_cell_compressor_results * pResults = &subset_results1[subset];
 
                                                                 pResults->m_pSelectors = &subset_selectors1[subset][0];
                                                                 pResults->m_pSelectors_temp = selectors_temp;
 
-                                                                uint64_t err = color_cell_compression(1, pParams, pResults, pComp_params, subset_total_colors1[subset], &subset_colors[subset][0], (num_solutions2 <= 2) || disable_faster_part_selection);
+                                                                uint64_t err = color_cell_compression(1, pParams, pResults, pComp_params, subset_total_colors1[subset], &subset_colors[subset][0], (num_solutions2 <= 2) || disable_faster_part_selection, best_err);
                                                                 assert(err == pResults->m_best_overall_err);
 
                                                                 trial_err += err;
                                                                 if (trial_err > best_err)
                                                                                 break;
+                                                                                if (err >= best_err)  // LOSSLESS: subset can't beat best_err
+                                                                                                break;
                                                                                 
                                                 } // subset
 
                                                 if (trial_err < best_err)
                                                 {
                                                                 best_err = trial_err;
-                                                        best_non_3subset_err = trial_err;
 
                                                                 opt_results.m_mode = 1;
                                                                 opt_results.m_index_selector = 0;
@@ -5086,7 +5432,7 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
                                                 }
                                 }
 
-                                if ((num_solutions2 > 2) && (opt_results.m_mode == 1) && (!disable_faster_part_selection))
+                                if ((num_solutions2 > 2) && (opt_results.m_mode == 1) && (!disable_faster_part_selection) && best_err > 0)
                                 {
                                                 const uint32_t trial_partition = opt_results.m_partition;
                                                 assert(trial_partition < 64);
@@ -5117,15 +5463,21 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
                                                                 subset_total_colors1[p]++;
                                                 }
                                                                                                                                 
+                                                const uint32_t subset_order1[2] = {
+                                                                 (subset_total_colors1[1] > subset_total_colors1[0]) ? 1u : 0u,
+                                                                 (subset_total_colors1[1] > subset_total_colors1[0]) ? 0u : 1u
+                                                };
+
                                                 uint64_t trial_err = 0;
-                                                for ( uint32_t subset = 0; subset < 2; subset++)
+                                                for ( uint32_t s = 0; s < 2; s++)
                                                 {
+                                                                 const uint32_t subset = subset_order1[s];
                                                                  color_cell_compressor_results * pResults = &subset_results1[subset];
 
                                                                 pResults->m_pSelectors = &subset_selectors1[subset][0];
                                                                 pResults->m_pSelectors_temp = selectors_temp;
 
-                                                                uint64_t err = color_cell_compression(1, pParams, pResults, pComp_params, subset_total_colors1[subset], &subset_colors[subset][0], true);
+                                                                uint64_t err = color_cell_compression(1, pParams, pResults, pComp_params, subset_total_colors1[subset], &subset_colors[subset][0], true, best_err);
                                                                 assert(err == pResults->m_best_overall_err);
 
                                                                 trial_err += err;
@@ -5137,7 +5489,6 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
                                                 if (trial_err < best_err)
                                                 {
                                                                 best_err = trial_err;
-                                                        best_non_3subset_err = trial_err;
 
                                                                 for ( uint32_t subset = 0; subset < 2; subset++)
                                                                 {
@@ -5251,11 +5602,13 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
                                                                                                 pResults->m_pSelectors = &stage1_selectors[subset][0];
                                                                                                 pResults->m_pSelectors_temp = selectors_temp;
 
-                                                                                                uint64_t err = color_cell_compression(0, pParams, pResults, pComp_params, subset_total_s1[subset], &subset_colors_s1[subset][0], false);
+                                                                                                uint64_t err = color_cell_compression(0, pParams, pResults, pComp_params, subset_total_s1[subset], &subset_colors_s1[subset][0], false, best_err);
 
                                                                                                 part_err += err;
                                                                                                 if (part_err > best_stage1_err)
                                                                                                                 break;
+                                                                                                                if (err >= best_stage1_err)  // LOSSLESS
+                                                                                                                                                                break;
                                                                                 } // subset
 
                                                                                 if (part_err < best_stage1_err)
@@ -5298,10 +5651,11 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
                                                                                                 pResults->m_pSelectors = &subset_selectors0[subset][0];
                                                                                                 pResults->m_pSelectors_temp = selectors_temp;
 
-                                                                                                uint64_t err = color_cell_compression(0, pParams, pResults, pComp_params, subset_total_colors0[subset], &subset_colors[subset][0], true);
+                                                                                                uint64_t err = color_cell_compression(0, pParams, pResults, pComp_params, subset_total_colors0[subset], &subset_colors[subset][0], true, best_err);
                                                                                                 assert(err == pResults->m_best_overall_err);
 
                                                                                                 mode0_err += err;
+                                                                                                if (mode0_err > best_err) break;  // LOSSLESS
                                                                                 } // subset
 
                                                                                 if (mode0_err < best_err)
@@ -5332,7 +5686,7 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
                                                 }
                                 
                 // Mode 3 (2-subset, 7+1-bit color with shared pbit, 2-bit indices)
-                if (pComp_params->m_opaque_settings.m_use_mode[3] && !skip_multisubset && try_3_subset)
+                if (pComp_params->m_opaque_settings.m_use_mode[3] && !skip_multisubset && try_3_subset && best_err > 0)
                 {
                                 pParams->m_pSelector_weights = g_bc7_weights2;
                                 pParams->m_pSelector_weightsx = (const vec4F *)&g_bc7_weights2x[0];
@@ -5377,26 +5731,34 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
                                                                 subset_total_colors3[p]++;
                                                 }
 
+                                                // LOSSLESS SPEEDUP: Process larger subset first (see Mode 1).
+                                                const uint32_t subset_order3[2] = {
+                                                                 (subset_total_colors3[1] > subset_total_colors3[0]) ? 1u : 0u,
+                                                                 (subset_total_colors3[1] > subset_total_colors3[0]) ? 0u : 1u
+                                                };
+
                                                 uint64_t trial_err = 0;
-                                                for ( uint32_t subset = 0; subset < 2; subset++)
+                                                for ( uint32_t s = 0; s < 2; s++)
                                                 {
+                                                                 const uint32_t subset = subset_order3[s];
                                                                  color_cell_compressor_results * pResults = &subset_results3[subset];
 
                                                                 pResults->m_pSelectors = &subset_selectors3[subset][0];
                                                                 pResults->m_pSelectors_temp = selectors_temp;
 
-                                                                uint64_t err = color_cell_compression(3, pParams, pResults, pComp_params, subset_total_colors3[subset], &subset_colors[subset][0], (num_solutions2 <= 2) || disable_faster_part_selection);
+                                                                uint64_t err = color_cell_compression(3, pParams, pResults, pComp_params, subset_total_colors3[subset], &subset_colors[subset][0], (num_solutions2 <= 2) || disable_faster_part_selection, best_err);
                                                                 assert(err == pResults->m_best_overall_err);
 
                                                                 trial_err += err;
                                                                 if (trial_err > best_err)
                                                                                 break;
+                                                                                if (err >= best_err)  // LOSSLESS: subset can't beat best_err
+                                                                                                break;
                                                 } // subset
 
                                                 if (trial_err < best_err)
                                                 {
                                                                 best_err = trial_err;
-                                                        best_non_3subset_err = trial_err;
                                                                                                                                                                 
                                                                 opt_results.m_mode = 3;
                                                                 opt_results.m_index_selector = 0;
@@ -5423,7 +5785,7 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
 
                                 } // solution_index
 
-                                if ((num_solutions2 > 2) && (opt_results.m_mode == 3) && (!disable_faster_part_selection))
+                                if ((num_solutions2 > 2) && (opt_results.m_mode == 3) && (!disable_faster_part_selection) && best_err > 0)
                                 {
                                                 const uint32_t trial_partition = opt_results.m_partition;
                                                 assert(trial_partition < 64);
@@ -5456,15 +5818,21 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
                                                                 subset_total_colors3[p]++;
                                                 }
 
+                                                const uint32_t subset_order3[2] = {
+                                                                 (subset_total_colors3[1] > subset_total_colors3[0]) ? 1u : 0u,
+                                                                 (subset_total_colors3[1] > subset_total_colors3[0]) ? 0u : 1u
+                                                };
+
                                                 uint64_t trial_err = 0;
-                                                for ( uint32_t subset = 0; subset < 2; subset++)
+                                                for ( uint32_t s = 0; s < 2; s++)
                                                 {
+                                                                 const uint32_t subset = subset_order3[s];
                                                                  color_cell_compressor_results * pResults = &subset_results3[subset];
 
                                                                 pResults->m_pSelectors = &subset_selectors3[subset][0];
                                                                 pResults->m_pSelectors_temp = selectors_temp;
 
-                                                                uint64_t err = color_cell_compression(3, pParams, pResults, pComp_params, subset_total_colors3[subset], &subset_colors[subset][0], true);
+                                                                uint64_t err = color_cell_compression(3, pParams, pResults, pComp_params, subset_total_colors3[subset], &subset_colors[subset][0], true, best_err);
                                                                 assert(err == pResults->m_best_overall_err);
 
                                                                 trial_err += err;
@@ -5475,7 +5843,6 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
                                                 if (trial_err < best_err)
                                                 {
                                                                 best_err = trial_err;
-                                                        best_non_3subset_err = trial_err;
                                                                                                                                                                 
                                                                 for ( uint32_t subset = 0; subset < 2; subset++)
                                                                 {
@@ -5499,7 +5866,7 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
 
                 // Mode 5 (1-subset, 7-bit color + 8-bit alpha, separate selectors)
                 // Only useful for opaque blocks when using rotation to treat one RGB channel as alpha.
-                if ((!pComp_params->m_perceptual) && (pComp_params->m_opaque_settings.m_use_mode[5]) && !skip_multisubset)
+                if ((!pComp_params->m_perceptual) && (pComp_params->m_opaque_settings.m_use_mode[5]) && !skip_multisubset && best_err > 0)
                 {
                                  color_cell_compressor_params params5 = *pParams;
 
@@ -5507,6 +5874,10 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
                                 {
                                                 if ((pComp_params->m_mode5_rotation_mask & (1 << rotation)) == 0)
                                                                 continue;
+                                                // LOSSLESS: For opaque blocks, rotation 0 (no swap) is dominated by
+                                                // Mode 6 (8-bit RGB step 1, 16 selectors vs 7-bit step 2, 4 selectors).
+                                                // Alpha=255 is trivial in both. Skip to save 1 color_cell_compression call.
+                                                if (rotation == 0) continue;
 
                                                 memcpy(params5.m_weights, pParams->m_weights, sizeof(params5.m_weights));
                                                 if (rotation)
@@ -5645,20 +6016,33 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
                                                 int subset_selectors2[3][16];
                                                 color_cell_compressor_results subset_results2[3];
                                                                                                 
+                                                // LOSSLESS SPEEDUP: Process subsets largest-first.
+                                                // 3-element sorting network (descending by pixel count).
+                                                // Larger subset = higher accumulated error = earlier
+                                                // early-exit when Mode 2 can't beat best_err.
+                                                uint32_t subset_order2[3] = { 0, 1, 2 };
+                                                #define M2_SWAP(i,j) if (subset_total_colors2[subset_order2[i]] < subset_total_colors2[subset_order2[j]]) { uint32_t _t = subset_order2[i]; subset_order2[i] = subset_order2[j]; subset_order2[j] = _t; }
+                                                M2_SWAP(0, 1);
+                                                M2_SWAP(1, 2);
+                                                M2_SWAP(0, 1);
+                                                #undef M2_SWAP
+
                                                 uint64_t mode2_err = 0;
-                                                for ( uint32_t subset = 0; subset < 3; subset++)
+                                                for ( uint32_t s = 0; s < 3; s++)
                                                 {
+                                                                 const uint32_t subset = subset_order2[s];
                                                                  color_cell_compressor_results * pResults = &subset_results2[subset];
 
                                                                 pResults->m_pSelectors = &subset_selectors2[subset][0];
                                                                 pResults->m_pSelectors_temp = selectors_temp;
 
-                                                                uint64_t err = color_cell_compression(2, pParams, pResults, pComp_params, subset_total_colors2[subset], &subset_colors[subset][0], true);
+                                                                uint64_t err = color_cell_compression(2, pParams, pResults, pComp_params, subset_total_colors2[subset], &subset_colors[subset][0], true, best_err);
                                                                 assert(err == pResults->m_best_overall_err);
 
                                                                 mode2_err += err;
                                                                 if (mode2_err > best_err)
                                                                                 break;
+                                                                                if (err >= best_err) break;  // LOSSLESS
                                                 } // subset
 
                                                 if (mode2_err < best_err)
@@ -5684,12 +6068,13 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
                                                                                 opt_results.m_high[subset] = subset_results2[subset].m_high_endpoint;
                                                                 }
                                                 }
+                                                if (best_err == 0) break; // LOSSLESS: can't beat 0 error
                                 }
                 }
 
                 // Mode 4 (1-subset, 5-bit RGB + 6-bit alpha, separate selectors, rotation)
                 // For opaque blocks this uses rotation to treat an RGB channel as "alpha".
-                if ((!pComp_params->m_perceptual) && (pComp_params->m_opaque_settings.m_use_mode[4]) && !skip_multisubset)
+                if ((!pComp_params->m_perceptual) && (pComp_params->m_opaque_settings.m_use_mode[4]) && !skip_multisubset && best_err > 0)
                 {
                                  color_cell_compressor_params params4 = *pParams;
 
@@ -5697,6 +6082,10 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
                                 {
                                                 if ((pComp_params->m_mode4_rotation_mask & (1 << rotation)) == 0)
                                                                 continue;
+                                                // LOSSLESS: For opaque blocks, rotation 0 (no swap) is dominated by
+                                                // Mode 6 (8-bit RGB step 1, 16 selectors vs 5-bit step 8, 2 selectors).
+                                                // Alpha=255 is trivial in both. Skip to save 1 color_cell_compression call.
+                                                if (rotation == 0) continue;
 
                                                 memcpy(params4.m_weights, pParams->m_weights, sizeof(params4.m_weights));
                                                 if (rotation)
@@ -5732,7 +6121,6 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
                                                 if (trial_mode4_err < best_err)
                                                 {
                                                                 best_err = trial_mode4_err;
-                                                        best_non_3subset_err = trial_mode4_err;
 
                                                                 opt_results.m_mode = 4;
                                                                 opt_results.m_index_selector = trial_opt_results4.m_index_selector;
@@ -5998,9 +6386,6 @@ void bc7e_compress_block_params_init(bc7e_compress_block_params *  p,  bool perc
                 p->m_mode4_index_mask = 3;
                 p->m_mode5_rotation_mask = 0xF;
                 p->m_uber1_mask = 7;
-
-                // OPTION G: disabled by default — set via env var DCPENALY=f in test harness
-                p->m_partition_dc_penalty_weight = 0.0f;
 
                 p->m_opaque_settings.m_use_mode[0] = false;
                 p->m_opaque_settings.m_use_mode[1] = true;

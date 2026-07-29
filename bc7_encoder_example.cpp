@@ -1,5 +1,4 @@
-// bc7_encoder_example.cpp - Multithreaded scalar BC7 encoder with atomic work stealing
-//                          + M7TO5 post-encode bias fix (NO DECODING).
+// bc7_encoder_example.cpp - Multithreaded scalar BC7 encoder with atomic work stealing.
 //
 // IMPORTANT: This must be compiled as a single translation unit because
 // bc7_encoder_base.h defines non-inline functions and globals (g_codec_initialized).
@@ -23,39 +22,9 @@
 // tail latency from variable block compression times.
 //
 // ============================================================================
-// M7TO5 POST-ENCODE BIAS FIX (NO DECODING)
-// ============================================================================
-// After the main encode, a selective post-encode pass walks every block.
-// For each block currently encoded in Mode 4 (5-bit endpoints, 1-subset) or
-// Mode 7 (5-bit endpoints, 2-subset) — the two bias-prone modes — we estimate
-// the green DC bias directly from the encoded endpoint bits, WITHOUT calling
-// any decoder. If |estimated_bias| > threshold (1.0), we re-encode that one
-// block in Mode 5 only AND Mode 6 only (both 7-bit endpoints, single-subset),
-// estimate the new bias for each candidate the same way (from endpoints), and
-// swap in whichever candidate has the lowest |bias|, provided it actually
-// improves on the original. No SSE check is performed (the user's preferred
-// tol=1000% effectively disabled it anyway). No decode library is invoked
-// during the post-encode pass.
-//
-// Bias estimation:
-//   For Mode 4/5/6 (1-subset):  avg_decoded_g ~= (e0_g_8 + e1_g_8) / 2
-//   For Mode 7     (2-subset):  avg_decoded_g ~= (n0*(e0_g_8+e1_g_8)/2
-//                                            +  n1*(e2_g_8+e3_g_8)/2) / 16
-//   where n0/n1 are pixel counts per subset from the partition table.
-//
-//   bias = avg_decoded_g - avg_input_g
-//
-// This is an approximation (assumes uniform index distribution within each
-// subset), but for the smooth regions that actually suffer from DC bias the
-// distribution is typically diverse enough that (e0+e1)/2 is a good estimate.
-// ============================================================================
 
 #include "bc7_encoder_base.h"
 #include "bc7_metrics.h"
-
-// NOTE: bc7_encoder_simd.h, bc7_encoder_dispatch.h, and
-// bc7_encoder_simd_impl.inc are intentionally NOT included.
-// We call bc7e_compress_block_range (scalar) from bc7_encoder_base.h directly.
 
 #include <cstdio>
 #include <cstdlib>
@@ -70,11 +39,6 @@
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
-
-// ---------------------------------------------------------------------------
-// M7TO5 post-encode: NO DECODING. Bias estimated from endpoint bits directly.
-// ---------------------------------------------------------------------------
-#include "m7to5_nodecode.h"
 
 
 //
@@ -192,8 +156,8 @@ public:
         // Quality 2 (default/balanced)
         bc7e_compress_block_params params;
         bc7e_compress_block_params_init(&params, false);
-        //params.m_refinement_passes = 2;
-        //params.m_uber_level = 1;   // enables the PCA seed improvement (mode 1/3)
+        //params.m_refinement_passes = 2;//
+        params.m_uber_level = 1;   // screw it this is a quality booster option with minimal performance penalty so whatever
 
         // bc7e_compress_block_init() initializes the codec's lookup tables
         // (defined in bc7_encoder_base.h, independent of any SIMD path).
@@ -251,19 +215,6 @@ public:
                 total_blocks, encode_ms,
                 encode_ms > 0 ? (total_blocks / (encode_ms / 1000.0)) : 0.0,
                 num_threads);
-
-        // ---- M7TO5 POST-ENCODE BIAS FIX (NO DECODING) ----
-        // Selectively re-encode Mode 4 / Mode 7 blocks with high green DC
-        // bias into Mode 5 or Mode 6 (7-bit endpoints, single-subset) to
-        // eliminate the block-aligned discoloration blobs caused by 5-bit
-        // endpoint quantization. Bias is estimated directly from the encoded
-        // endpoint bits — no decoder is invoked.
-        auto t2 = std::chrono::high_resolution_clock::now();
-        m7to5_nodecode::run(blocks.data(), pixels_rgba.data(), total_blocks,
-                            &params, /*bias_threshold=*/1.0f, num_threads);
-        auto t3 = std::chrono::high_resolution_clock::now();
-        double post_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
-        fprintf(stderr, "M7TO5 post-encode: %.1f ms\n", post_ms);
 
         bc7_out.resize(total_blocks * 16);
         memcpy(bc7_out.data(), blocks.data(), total_blocks * 16);
@@ -371,7 +322,7 @@ int main(int argc, char* argv[])
     fprintf(stderr, "Wrote %s\n", out_path);
 
     // Mode Visualization
-    std::string mode_vis_path = out_path;
+    /*std::string mode_vis_path = out_path;
     size_t dot_pos = mode_vis_path.find_last_of('.');
     if (dot_pos != std::string::npos) {
         mode_vis_path = mode_vis_path.substr(0, dot_pos) + "_modes.ppm";
@@ -381,7 +332,7 @@ int main(int argc, char* argv[])
     generate_mode_visualization(mode_vis_path.c_str(), bc7.data(), w, h);
 
     // Quality Metrics (matches bc7enc output format)
-    compute_and_print_all_metrics(pixels, bc7.data(), bc7.size(), w, h);
+    compute_and_print_all_metrics(pixels, bc7.data(), bc7.size(), w, h);*/
 
     stbi_image_free(pixels);
     return 0;

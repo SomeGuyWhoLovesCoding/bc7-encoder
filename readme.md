@@ -6,11 +6,17 @@ It is completely beginner friendly and that's it.
 
 And there's also minimal quality loss too, meaning this is the literal fastest whilst preventing some sort of artitacting that went on compared to DirectXTex too. My use-case stands, and I will always automate bc7 encoding with the highest quality possible whilst retaining the nice efficiency I get!
 
-Now for PSNR comparison...
-
-![Oop! One pixel difference.](barchart.png)
-
 Yep. Mine's virtually identical, and also (possibly) better quality than others, except it's multitudes faster because I just observed the exact speed of each of the encoders on the list and have done vastly big amounts of other plentiful optimizations.
+
+## How to compile
+
+If you really want to contribute, here's this:
+
+Linux distros: `g++ -std=c++17 -O3 -pthread bc7_encoder_example.cpp -o bc7_encoder_example -lm`
+
+Windows: `cl.exe /Fe"F:\jerem\NewDownloads\official-bc7-encoder\bc7-encoder\bc7.exe" "F:\jerem\NewDownloads\official-bc7-encoder\bc7-encoder\bc7_encoder_example.cpp" -O2 /std:c++14`
+
+(Make sure you have Visual Studio installed before finding x64 Native Tools Command Prompt — should be in your "Visual Studio YEAR" folder in the startup menu)
 
 ---
 
@@ -136,16 +142,4 @@ It also doesn't matter if it's power of two, because this is entirely CPU-based 
 
 ## Comparison time! (finally)
 
-(views from [tacentview](https://github.com/bluescan/tacentview))
-
-<img width="1920" height="1050" alt="image" src="https://github.com/user-attachments/assets/c87fa9a0-1973-47e4-8906-87d8ec9c0c31" />
-
-BC7 output with bc7-encoder
-
-<img width="1920" height="1050" alt="image" src="https://github.com/user-attachments/assets/4e1e3cc9-760d-4c35-8bd5-d08aae5ed973" />
-
-PNG reference
-
-**Now, for a highlight, here:**
-
-<img width="1320" height="1653" alt="image" src="https://github.com/user-attachments/assets/0d477e72-8a6c-48e8-bd2d-5e6d5e38de55" />
+... New comin
