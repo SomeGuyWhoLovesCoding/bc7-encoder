@@ -14,7 +14,7 @@
 //   cl /EHsc /O2 /std:c++17 /I. bc7_encoder_example.cpp /Fe:bc7_encoder_example.exe
 //
 // Usage:
-//   bc7_encoder_example input.png output.dds
+//   bc7_encoder_example <input.png> <output.dds> [-pmalpha]
 //
 // Quality is locked to level 2 (default/balanced).
 // Uses all available CPU cores via std::thread with atomic work stealing
@@ -289,13 +289,27 @@ static void generate_mode_visualization(const char* filename, const uint8_t* bc7
 
 int main(int argc, char* argv[])
 {
-    if (argc < 3) {
-        fprintf(stderr, "Usage: %s <input.png> <output.dds>\n", argv[0]);
-        return 1;
+    bool premultiplied_alpha = false;
+    const char* in_path = nullptr;
+    const char* out_path = nullptr;
+
+    // Flexible argument parsing to handle optional -pmalpha flag
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "-pmalpha") {
+            premultiplied_alpha = true;
+        } else if (!in_path) {
+            in_path = argv[i];
+        } else if (!out_path) {
+            out_path = argv[i];
+        }
     }
 
-    const char* in_path = argv[1];
-    const char* out_path = argv[2];
+    if (!in_path || !out_path) {
+        fprintf(stderr, "Usage: %s <input.png> <output.dds> [-pmalpha]\n", argv[0]);
+        fprintf(stderr, "  -pmalpha : Preprocess the image with premultiplied alpha before encoding.\n");
+        return 1;
+    }
 
     int w = 0, h = 0, ch = 0;
     uint8_t* pixels = stbi_load(in_path, &w, &h, &ch, 4);
@@ -305,6 +319,27 @@ int main(int argc, char* argv[])
     }
 
     fprintf(stderr, "Loaded %dx%d image \"%s\" - %d channels\n", w, h, in_path, ch);
+
+    // Apply premultiplied alpha preprocessing if requested
+    if (premultiplied_alpha) {
+        fprintf(stderr, "Applying premultiplied alpha preprocessing...\n");
+        size_t num_pixels = (size_t)w * h;
+        for (size_t i = 0; i < num_pixels; i++) {
+            uint8_t a = pixels[i * 4 + 3];
+            if (a < 255) {
+                if (a == 0) {
+                    pixels[i * 4 + 0] = 0;
+                    pixels[i * 4 + 1] = 0;
+                    pixels[i * 4 + 2] = 0;
+                } else {
+                    // Integer math premultiplication: (color * alpha) / 255
+                    pixels[i * 4 + 0] = (uint8_t)((pixels[i * 4 + 0] * a) / 255);
+                    pixels[i * 4 + 1] = (uint8_t)((pixels[i * 4 + 1] * a) / 255);
+                    pixels[i * 4 + 2] = (uint8_t)((pixels[i * 4 + 2] * a) / 255);
+                }
+            }
+        }
+    }
 
     BC7Encoder encoder;
     std::vector<uint8_t> bc7;
