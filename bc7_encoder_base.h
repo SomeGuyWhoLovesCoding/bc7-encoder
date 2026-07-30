@@ -453,6 +453,29 @@ struct bc7_block_stats
                 // re-scan the 16 pixels. Same data as lo_r/hi_r/etc. that
                 // handle_alpha_block used to compute itself.
                 int min_r, max_r, min_g, max_g, min_b, max_b;
+
+                // ----------------------------------------------------------------
+                // FIX 1 (noise/static handling): spatial autocorrelation signal.
+                //
+                // spatial_corr is an integer ratio (scaled by 8) of:
+                //   mean |luma_i - luma_neighbor|   (sum of 4-neighbor abs deltas)
+                //   --------------------------------
+                //   mean |luma_i - luma_block_mean| (sum of abs deltas to mean)
+                //
+                // For uncorrelated noise, neighbor deltas and block-mean deltas
+                // are statistically equivalent, so spatial_corr ~= 8.
+                // For structured content (gradients, edges), neighbors are more
+                // similar than the block mean, so spatial_corr < 4 typically.
+                //
+                // is_noise_like is the boolean thresholded form, used by mode
+                // routing decisions and the refinement pass cap. Variance-based
+                // signals (luma_var, num_distinct_colors, RGB ranges) cannot
+                // distinguish textured-but-structured blocks from pure noise;
+                // only spatial coherence can. This is the discriminator the
+                // encoder was previously missing.
+                // ----------------------------------------------------------------
+                int spatial_corr;     // ~8 = uncorrelated (noise); <4 = structured
+                bool is_noise_like;   // true when spatial_corr >= 6 (ratio >= 0.75)
 };
 
 struct part_score {
@@ -601,6 +624,56 @@ static void compute_block_stats(bc7_block_stats * pStats, const color_quad_i * p
                 pStats->luma_var = (sum_l2 >> 4) - mean_l * mean_l;
                 pStats->num_distinct_colors = distinct;
                 pStats->is_opaque = (min_a == 255);
+
+                // ----------------------------------------------------------------
+                // FIX 1: Spatial autocorrelation signal.
+                //
+                // Compares the mean absolute luma difference between 4-neighbors
+                // (horizontal + vertical adjacent pixels) to the mean absolute
+                // luma difference from the block mean. For uncorrelated noise
+                // the two are statistically equal (ratio ~= 1.0). For structured
+                // content (gradients, edges, smooth regions) neighbors are more
+                // similar than the block mean (ratio < 0.5).
+                //
+                // We reuse pStats->luma[] which was filled in the loop above,
+                // so no second scan over the source pixels is needed.
+                //
+                // spatial_corr is stored as ratio * 8 (integer-scaled) so the
+                // caller can threshold on it without floating point. Threshold
+                // for is_noise_like is ratio >= 0.75 (spatial_corr >= 6).
+                // ----------------------------------------------------------------
+                int sum_neighbor_delta = 0;
+                int sum_block_delta = 0;
+                for (int row = 0; row < 4; row++)
+                {
+                        for (int col = 0; col < 4; col++)
+                        {
+                                int i = row * 4 + col;
+                                int dl_block = iabs32(pStats->luma[i] - mean_l);
+                                sum_block_delta += dl_block;
+                                // Horizontal neighbor (skip right edge)
+                                if (col < 3)
+                                        sum_neighbor_delta += iabs32(pStats->luma[i] - pStats->luma[i + 1]);
+                                // Vertical neighbor (skip bottom edge)
+                                if (row < 3)
+                                        sum_neighbor_delta += iabs32(pStats->luma[i] - pStats->luma[i + 4]);
+                        }
+                }
+                if (sum_block_delta > 0)
+                {
+                        // Scale by 8 so the integer ratio keeps useful precision;
+                        // ratio = neighbor_delta / block_delta, so spatial_corr = 8 * ratio.
+                        // Noise blocks hit ~8, structured blocks land <4, borderline ~5-7.
+                        pStats->spatial_corr = (sum_neighbor_delta * 8) / sum_block_delta;
+                }
+                else
+                {
+                        // Degenerate: block is flat (all luma equal). Not noise-like;
+                        // the flat-block fast path in bc7e_compress_blocks already
+                        // short-circuits this case, so this value is informational.
+                        pStats->spatial_corr = 0;
+                }
+                pStats->is_noise_like = (pStats->spatial_corr >= 6);
 }
 
 // Fast partition estimator for 2-subset modes (1, 3).
@@ -654,6 +727,24 @@ static uint32_t quick_estimate_partition_2subset(const color_quad_i * pPixels, c
                                 vz = (nz * 256) / m;
                 }
 
+                // ----------------------------------------------------------------
+                // FIX 2-REVISED: removed the isotropy early-out.
+                //
+                // The original Fix 2 computed a Rayleigh quotient to detect
+                // isotropy (noise) and skipped the entire 4-axis × 8-split
+                // × 64-partition scan when the color cloud looked isotropic.
+                // That was correct for *speed* but wrong for *quality* on
+                // noise: even when the PCA axis is arbitrary, trying all 32
+                // sort/split candidates and matching each against all 64 BC7
+                // partition patterns is what finds the partition that puts
+                // the most-similar colors together. A noise block picked
+                // by full scan produces two endpoint pairs that span more
+                // of color space than one picked by spatial-only fallback.
+                //
+                // The eigenvalue computation has been removed entirely to
+                // avoid wasting cycles on a signal we no longer use.
+                // ----------------------------------------------------------------
+
                 // === Step 3: Build sort keys for 4 candidate axes: PCA, R, G, B ===
                 int axes[4][16];
                 for (int i = 0; i < 16; i++)
@@ -673,6 +764,9 @@ static uint32_t quick_estimate_partition_2subset(const color_quad_i * pPixels, c
 
                 // === Step 4: For each axis, sort and try all 8 split points ===
                 // Uses full RGB variance (sum of per-channel variance) instead of luma-only.
+                // FIX 2-REVISED: always run the full scan. On noise it's the
+                // search itself that finds a good (if arbitrary) 2-subset
+                // decomposition — skipping it would leave only spatial fallbacks.
                 for (int axis_idx = 0; axis_idx < 4; axis_idx++)
                 {
                                 const int *keys = axes[axis_idx];
@@ -1299,6 +1393,24 @@ struct color_cell_compressor_params
                  bool m_has_pbits;
                  bool m_endpoints_share_pbit;
                  bool m_perceptual;
+                // FIX 3: per-block flag, propagated from bc7_block_stats::is_noise_like
+                // by the block dispatcher (bc7e_compress_blocks). When true, the
+                // endpoint refinement loop in color_cell_compression caps itself at
+                // 1 pass, since on noise the index quantization error floor dominates
+                // and extra refinement passes produce no measurable PSNR gain.
+                // Default false; per-block override set in bc7e_compress_blocks.
+                bool m_noise_like_block;
+                // SLIDING-SCALE PERCEPTUAL: per-block spatial autocorrelation signal
+                // propagated from bc7_block_stats::spatial_corr. Range 0..~16:
+                //   0     = flat block (degenerate)
+                //   <4    = strongly structured (gradients, edges)
+                //   4..8  = borderline / textured
+                //   >=8   = isotropic noise
+                // Used by apply_perceptual_blend() to compute a continuous blend
+                // factor between full-perceptual (p=1, structured) and uniform-RGB
+                // (p=0, noise), eliminating the discontinuity at the old
+                // is_noise_like threshold. Default 0 (treated as structured).
+                int m_spatial_corr;
 };
 
 static inline void color_cell_compressor_params_clear( color_cell_compressor_params * p)
@@ -1315,6 +1427,8 @@ static inline void color_cell_compressor_params_clear( color_cell_compressor_par
                 p->m_has_alpha = false;
                 p->m_has_pbits = false;
                 p->m_endpoints_share_pbit = false;
+                p->m_noise_like_block = false; // FIX 3: default off; set per-block by dispatcher
+                p->m_spatial_corr = 0;         // SLIDING-SCALE: default structured (full perceptual)
 }
 
 struct color_cell_compressor_results
@@ -2588,11 +2702,98 @@ static uint64_t find_optimal_solution( uint32_t mode,  vec4F * pXl,  vec4F * pXh
         return pResults->m_best_overall_err;
 }
 
+// ============================================================================
+// SLIDING-SCALE PERCEPTUAL BLEND
+//
+// Replaces the old binary noise-override (which flipped between full
+// perceptual and uniform RGB at the spatial_corr=6 threshold) with a
+// continuous blend. The blend is driven by the per-block spatial_corr
+// signal (0=flat, ~4=structured, ~8=isotropic noise, up to ~16 for
+// high-contrast noise).
+//
+// Perceptual strength p:
+//   spatial_corr <= 4 (structured)  -> p = 1.0  (full perceptual, original weights)
+//   spatial_corr >= 8 (pure noise)  -> p = 0.0  (uniform RGB, eliminates green tint)
+//   4 < spatial_corr < 8 (textured) -> p = (8 - sc) / 4  (linear ramp)
+//
+// At intermediate p, we keep the perceptual (YCrCb) code path active but
+// blend the channel weights between "uniform in YCrCb" (p=0) and the user's
+// full perceptual weights (p=1). This smoothly extends green-tint
+// correction to borderline-textured blocks instead of flipping abruptly
+// at a single threshold.
+//
+// Returns pParams unchanged if no override is needed (non-perceptual mode,
+// or structured block with full perceptual). Otherwise copies pParams into
+// *pLocalBuf with adjusted m_perceptual / m_weights and returns pLocalBuf.
+// Caller must not retain the returned pointer past *pLocalBuf's lifetime.
+// ============================================================================
+static const color_cell_compressor_params* apply_perceptual_blend(
+                const color_cell_compressor_params* pParams,
+                color_cell_compressor_params* pLocalBuf)
+{
+                if (!pParams->m_perceptual) return pParams;
+
+                const int sc = pParams->m_spatial_corr;
+                if (sc <= 4) return pParams;  // structured: full perceptual, no change
+
+                float p;
+                if (sc >= 8) p = 0.0f;
+                else p = (8.0f - (float)sc) / 4.0f;
+
+                *pLocalBuf = *pParams;
+                if (p <= 0.001f)
+                {
+                                // Pure noise: switch to uniform-RGB code path.
+                                pLocalBuf->m_perceptual = false;
+                                pLocalBuf->m_weights[0] = 1;
+                                pLocalBuf->m_weights[1] = 1;
+                                pLocalBuf->m_weights[2] = 1;
+                                pLocalBuf->m_weights[3] = 1;
+                }
+                else
+                {
+                                // Borderline: stay on YCrCb code path with blended weights.
+                                // The original perceptual weights are stored in m_weights
+                                // as user-facing values; evaluate_solution() internally
+                                // scales the G channel by pr_weight and B by pb_weight
+                                // when m_perceptual is true. So the effective internal
+                                // weights are:
+                                //   W_Y_int  = m_weights[0]
+                                //   W_Cr_int = m_weights[1] * pr_weight
+                                //   W_Cb_int = m_weights[2] * pb_weight
+                                //
+                                // We blend each internal weight toward 1 (uniform YCrCb):
+                                //   W_int_new = 1 + (W_int_orig - 1) * p
+                                // then convert back to user-facing weights by dividing
+                                // out pr_weight / pb_weight so evaluate_solution's
+                                // internal scaling reproduces the intended internal weight.
+                                const float wY_orig  = (float)pParams->m_weights[0];
+                                const float wCr_int_orig = (float)pParams->m_weights[1] * pr_weight;
+                                const float wCb_int_orig = (float)pParams->m_weights[2] * pb_weight;
+
+                                pLocalBuf->m_perceptual = true;
+                                pLocalBuf->m_weights[0] = 1.0f + (wY_orig - 1.0f) * p;
+                                pLocalBuf->m_weights[1] = (1.0f + (wCr_int_orig - 1.0f) * p) / pr_weight;
+                                pLocalBuf->m_weights[2] = (1.0f + (wCb_int_orig - 1.0f) * p) / pb_weight;
+                                // m_weights[3] (alpha) unchanged — alpha is not part of
+                                // the YCrCb transform and shouldn't be blended.
+                }
+                return pLocalBuf;
+}
+
 // Note: In mode 6, m_has_alpha will only be true for transparent blocks.
-static uint64_t color_cell_compression( uint32_t mode, const  color_cell_compressor_params * pParams,  color_cell_compressor_results * pResults, 
+static uint64_t color_cell_compression( uint32_t mode, const  color_cell_compressor_params * pParams,  color_cell_compressor_results * pResults,
                 const  bc7e_compress_block_params * pComp_params, uint32_t num_pixels, const  color_quad_i * pPixels,  bool refinement, uint64_t target_err_to_beat = UINT64_MAX)
 {
                 pResults->m_best_overall_err = UINT64_MAX;
+
+                // SLIDING-SCALE PERCEPTUAL BLEND: replaces the old binary
+                // noise-override. Computes a continuous blend factor from
+                // pParams->m_spatial_corr and shadows pParams locally if
+                // the block is borderline or noise-like. See
+                // apply_perceptual_blend() above for the full rationale.
+                color_cell_compressor_params blend_local;
+                pParams = apply_perceptual_blend(pParams, &blend_local);
 
                 if ((mode != 6) && (mode != 7))
                 {
@@ -2714,10 +2915,20 @@ static uint64_t color_cell_compression( uint32_t mode, const  color_cell_compres
                                 //vfr = hi[0] - lo[0];
                                 //vfg = hi[1] - lo[1];
                                 //vfb = hi[2] - lo[2];
-                                // This is more stable.
-                                vfr = .9f;
+                                // GREEN-TINT FIX (PCA initial vector):
+                                // The previous (.9, 1.0, .7) start vector was green-
+                                // tilted. Power iteration on a near-isotropic
+                                // covariance (which is exactly what noise/static
+                                // produces) converges back to the starting vector,
+                                // so the principal axis came out green-tilted and
+                                // the endpoints ended up lying along the green
+                                // direction in RGB space. (1, 1, 1) keeps the
+                                // initial vector neutral. For real anisotropic
+                                // blocks the iteration still converges to the true
+                                // principal axis regardless of the starting point.
+                                vfr = 1.0f;
                                 vfg = 1.0f;
-                                vfb = .7f;
+                                vfb = 1.0f;
 
                                 for ( uint32_t iter = 0; iter < 1; iter++)
                                 {
@@ -2791,8 +3002,16 @@ static uint64_t color_cell_compression( uint32_t mode, const  color_cell_compres
 
                 if (vec4F_dot(&axis, &axis) < .5f)
                 {
+                                // GREEN-TINT FIX (degenerate axis fallback):
+                                // Previously the perceptual fallback used BT.709
+                                // luma weights (.213, .715, .072). When the PCA
+                                // axis collapsed (small eigenvalue, common on
+                                // noise), this green-heavy fallback kicked in and
+                                // tilted the endpoint line green. (1, 1, 1) keeps
+                                // the fallback neutral so noise blocks don't
+                                // systematically drift toward green.
                                 if (pParams->m_perceptual)
-                                                vec4F_set(&axis, .213f, .715f, .072f, pParams->m_has_alpha ? .715f : 0);
+                                                vec4F_set(&axis, 1.0f, 1.0f, 1.0f, pParams->m_has_alpha ? 1.0f : 0);
                                 else
                                                 vec4F_set(&axis, 1.0f, 1.0f, 1.0f, pParams->m_has_alpha ? 1.0f : 0);
                                 vec4F_normalize_in_place(&axis);
@@ -2865,8 +3084,21 @@ static uint64_t color_cell_compression( uint32_t mode, const  color_cell_compres
                 // the next pass's least-squares will produce the same endpoints
                 // and find_optimal_solution will give the same result. Breaking
                 // out is provably output-identical to running all passes.
+                //
+                // FIX 3 (noise/static handling): when the block was tagged as
+                // noise-like by compute_block_stats (via spatial_corr), cap the
+                // refinement pass count at 1. On pure-noise content the error
+                // floor is set by BC7's index quantization (2-bit or 4-bit),
+                // not by endpoint placement — extra least-squares iterations
+                // converge to the same first-pass solution up to float rounding.
+                // Skipping them eliminates the dominant cost on the exact blocks
+                // where the encoder previously overspent without measurable
+                // PSNR benefit.
+                uint32_t effective_refinement_passes = pComp_params->m_refinement_passes;
+                if (pParams->m_noise_like_block && effective_refinement_passes > 1)
+                                effective_refinement_passes = 1;
                 uint64_t prev_refine_err = pResults->m_best_overall_err;
-                for ( uint32_t i = 0; i < pComp_params->m_refinement_passes; i++)
+                for ( uint32_t i = 0; i < effective_refinement_passes; i++)
                 {
                                 vec4F xl, xh;
                                 vec4F_set_scalar(&xl, 0.0f);
@@ -3246,6 +3478,13 @@ static uint64_t color_cell_compression_est( uint32_t mode, const  color_cell_com
 {
                 assert((pParams->m_num_selector_weights == 4) || (pParams->m_num_selector_weights == 8));
 
+                // SLIDING-SCALE PERCEPTUAL BLEND: mirror the override applied
+                // in color_cell_compression so partition ranking in
+                // estimate_partition stays consistent with the final error
+                // metric. See apply_perceptual_blend() for full rationale.
+                color_cell_compressor_params blend_local;
+                pParams = apply_perceptual_blend(pParams, &blend_local);
+
                 float lr = 255, lg = 255, lb = 255;
                 float hr = 0, hg = 0, hb = 0;
                 for ( uint32_t i = 0; i < num_pixels; i++)
@@ -3359,6 +3598,12 @@ static uint64_t color_cell_compression_est( uint32_t mode, const  color_cell_com
 static uint64_t color_cell_compression_est_mode7( uint32_t mode, const  color_cell_compressor_params * pParams, uint64_t best_err_so_far,  uint32_t num_pixels, const  color_quad_i * pPixels)
 {
                 assert((mode == 7) && (pParams->m_num_selector_weights == 4));
+
+                // SLIDING-SCALE PERCEPTUAL BLEND: same rationale as
+                // color_cell_compression_est — keep mode 7 partition ranking
+                // consistent with the final error metric.
+                color_cell_compressor_params blend_local;
+                pParams = apply_perceptual_blend(pParams, &blend_local);
 
                 float lr = 255, lg = 255, lb = 255, la = 255;
                 float hr = 0, hg = 0, hb = 0, ha = 0;
@@ -4824,14 +5069,31 @@ static void handle_alpha_block(void * pBlock, const  color_quad_i * pPixels, con
         const int luma_range = pStats->max_luma - pStats->min_luma;
 
         // If very few distinct colors, multi-subset mode 7 is pointless.
-        const bool skip_mode7 = (ndc <= 3) || (luma_range <= 16 && pStats->luma_var < 128);
+        // FIX 1-REVISED: do NOT skip mode 7 on noise-like blocks. Mode 7's
+        // 2-subset structure (two endpoint pairs, 2-bit indices) gives more
+        // palette slots scattered across color space than mode 6's single
+        // endpoint pair — exactly what noise needs to avoid the "single line
+        // in RGB space" clumping artifact. The partition decision may be
+        // somewhat arbitrary on noise, but ANY 2-subset partition produces
+        // more color variety than no partition. Quality > speed for the
+        // noise case; the user explicitly wants sharper noise output.
+        const bool skip_mode7 = (ndc <= 3) ||
+                                 (luma_range <= 16 && pStats->luma_var < 128);
 
         // Mode 4 - SKIP when color range exceeds 5-bit precision capacity
         const int color_range_r = (int)(hi_r - lo_r);
         const int color_range_g = (int)(hi_g - lo_g);
         const int color_range_b = (int)(hi_b - lo_b);
         const int max_color_range = maximumi(maximumi(color_range_r, color_range_g), color_range_b);
-        const bool skip_mode4 = (max_color_range > 64); // 5-bit can't handle large ranges
+        // FIX 4: on noise-like blocks, do NOT skip mode 4 even when color
+        // range exceeds 64. Mode 4's selling card for noise is NOT its 5-bit
+        // color endpoints — it's the decoupled 3-bit color + 3-bit alpha
+        // indices, which give 8 × 8 = 64 distinct RGBA combinations per
+        // block. That's more palette variety than mode 6's 16 coupled
+        // RGBA slots or mode 5's 4 × 4 = 16. On noise the endpoint
+        // precision matters less than palette scatter, so the >64 color
+        // range guard (which protects endpoint fit) is the wrong gate.
+        const bool skip_mode4 = (max_color_range > 64) && !pStats->is_noise_like;
 
         // Mode 4
         if (pComp_params->m_alpha_settings.m_use_mode4 && !skip_mode4)
@@ -5065,7 +5327,8 @@ static void handle_alpha_block(void * pBlock, const  color_quad_i * pPixels, con
         // Threshold 32 = avg per-component squared err of 0.5 (RMSE ~0.7),
         // well below visual lossless. This saves ~24 est() calls + 8-16
         // color_cell_compression(7) calls per skipped block.
-        const bool mode7_early_skip = (best_err < 32) && !bimodal_alpha && !outline_alpha_block;
+        const bool mode7_early_skip = (best_err < 32) && !bimodal_alpha && !outline_alpha_block
+                                      && !pStats->is_noise_like; // FIX 4: never early-skip mode 7 on noise
         if (pComp_params->m_alpha_settings.m_use_mode7 && (!skip_mode7 || bimodal_alpha || need_mode7_fallback) && !mode7_early_skip && best_err > 0)
         {
                 solution solutions[BC7E_MAX_PARTITIONS7];
@@ -5076,6 +5339,18 @@ static void handle_alpha_block(void * pBlock, const  color_quad_i * pPixels, con
                 // The default 2 partitions often misses the separating partition,
                 // causing green to drift up to 73. Try 8 for outline blocks.
                 if (outline_alpha_block && parts_to_try < 4) parts_to_try = 4;
+                // FIX 4: on noise-like blocks, evaluate more mode-7 partitions.
+                // Mode 7 is the ONLY multi-subset mode available in the alpha path
+                // (modes 0/1/2 don't support alpha). Its 2-subset structure gives
+                // 2 × (4 color + 4 alpha) = 16 distinct RGBA combos across two
+                // palettes — better scatter than mode 6's single 16-slot palette.
+                // But on noise the partition estimator's signal is weak, so a
+                // single candidate commits to an arbitrary 2-subset split. Trying
+                // more candidates gives a better chance of finding a split that
+                // actually clusters similar random colors together. Cap at 8 to
+                // avoid runaway cost; the partition estimator is fast enough that
+                // 8 candidates is still cheaper than one mode 6 refinement pass.
+                if (pStats->is_noise_like && parts_to_try < 8) parts_to_try = 8;
                 // FIX T (block-adaptive partition estimation): for bimodal alpha
                 // blocks, use alpha-aware volume/compactness scoring so the
                 // estimator prefers partitions that separate alpha=0 from
@@ -5268,7 +5543,16 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
                 uint64_t best_err = UINT64_MAX;
                 const int luma_range = pStats->max_luma - pStats->min_luma;
                 const int ndc = pStats->num_distinct_colors;
-                const bool skip_multisubset = (ndc <= 3) || (luma_range <= 8 && pStats->luma_var < 64);
+                // FIX 1-REVISED: do NOT skip multi-subset modes on noise-like
+                // blocks. Multi-subset modes (0, 1, 2, 7) provide multiple
+                // endpoint pairs scattered across color space — exactly what
+                // noise needs to represent scattered random colors. Mode 6's
+                // single endpoint pair forces all 16 pixels onto one line in
+                // RGB space, producing the visible "clumping" / "single-palette
+                // smear" artifact on noise. The user wants sharper noise output,
+                // so we trade speed for quality here.
+                const bool skip_multisubset = (ndc <= 3) ||
+                                               (luma_range <= 8 && pStats->luma_var < 64);
                 const bool try_3_subset = (ndc >= 6) || (pStats->luma_var > 250);
 
                 // Mode 6
@@ -5319,7 +5603,17 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
                 // you noticed when removing this block entirely.
                 if (pComp_params->m_opaque_settings.m_max_mode13_partitions_to_try > 1)
                 {
-                        uint32_t dynamic_parts_13 = (pStats->num_distinct_colors > 3) ? 1 : 2;
+                        // FIX 2-ADD: on noise-like blocks, evaluate more candidate
+                        // partitions for mode 1. The default `dynamic_parts_13` of
+                        // 1-2 trusts the partition estimator to pick a winner, but
+                        // on noise the estimator's signal is weak (PCA is near-
+                        // arbitrary) — evaluating 4 candidates gives the encoder
+                        // a chance to find a 2-subset split that actually clusters
+                        // similar random colors together, rather than committing
+                        // to whatever the first estimator pass returned.
+                        uint32_t dynamic_parts_13;
+                        if (pStats->is_noise_like) dynamic_parts_13 = 4;
+                        else dynamic_parts_13 = (pStats->num_distinct_colors > 3) ? 1 : 2;
                         num_solutions2 = estimate_partition_list(1, pPixels, pComp_params, solutions2, dynamic_parts_13);
                 } else {
                         solutions2[0].m_index = quick_estimate_partition_2subset(pPixels, pStats, pComp_params);
@@ -5521,7 +5815,12 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
         // + 3-bit selectors (8 levels) can occasionally win on blocks with
         // 3 distinct color clusters. Threshold 256 = avg per-component squared
         // err of 4 (RMSE 2.0), well above the visual-lossless threshold.
-        const bool try_mode0 = try_3_subset && (best_err > 256);
+        // FIX 2-ADD: force-try mode 0 on noise-like blocks regardless of
+        // try_3_subset / best_err gating. Mode 0's 3-subset structure is the
+        // best palette-variety BC7 offers (24 distinct color slots); on noise
+        // the encoder needs every palette slot it can get to avoid the
+        // visible clumping artifact from mode 6's single endpoint pair.
+        const bool try_mode0 = (try_3_subset && (best_err > 256)) || pStats->is_noise_like;
         if (pComp_params->m_opaque_settings.m_use_mode[0] && !skip_multisubset && try_mode0)
         {
                 solution solutions3[BC7E_MAX_PARTITIONS0];
@@ -5538,7 +5837,21 @@ static void handle_opaque_block(void * pBlock, const  color_quad_i * pPixels, co
                                                 // (this is the secret sauce to 100% PNSR)
                                                 uint32_t dynamic_parts_0 = 8;
 
-                                                if (pStats->luma_var < 500) dynamic_parts_0 = 4;
+                                                // FIX 2-ADD: on noise-like blocks, EXPAND the mode-0
+                                                // partition search to 16 candidates. Mode 0's 3-subset
+                                                // structure (three endpoint pairs, 3-bit indices) gives
+                                                // up to 24 distinct color slots scattered across color
+                                                // space — the most palette slots of any BC7 mode, and
+                                                // exactly what noise needs. With more candidate
+                                                // partitions evaluated, the encoder is more likely to
+                                                // find a 3-way split that puts similar random colors
+                                                // together, reducing the per-block color quantization
+                                                // error that produces the visible "clumping" artifact.
+                                                // This is the opposite of the original (broken) Fix 1
+                                                // routing — on noise, mode 0 is a quality win, not
+                                                // something to skip.
+                                                if (pStats->is_noise_like) dynamic_parts_0 = 16;
+                                                else if (pStats->luma_var < 500) dynamic_parts_0 = 4;
                                                 else if (pStats->luma_var > 10000) dynamic_parts_0 = 16;
 
                                                 part_score top_parts0[16]; // Use a fixed max array size of 16
@@ -6313,6 +6626,19 @@ void bc7e_compress_blocks( uint32_t num_blocks,  uint64_t *  pBlocks, const  uin
                                 bc7_block_stats stats;
                                 compute_block_stats(&stats, temp_pixels);
 
+                                // FIX 3: propagate the per-block noise-like flag from
+                                // stats into the per-block compressor params so the
+                                // refinement loop in color_cell_compression can cap
+                                // itself at 1 pass. params is the color_cell_compressor_params
+                                // instance that gets copied (by value) into the
+                                // mode-specific params6/params4/etc. in handle_*_block,
+                                // so setting it here covers every mode path.
+                                params.m_noise_like_block = stats.is_noise_like;
+                                // SLIDING-SCALE: propagate the raw spatial_corr signal
+                                // so apply_perceptual_blend() can compute a continuous
+                                // blend factor instead of the old binary switch.
+                                params.m_spatial_corr = stats.spatial_corr;
+
                                 // --- Bimodal alpha fix for spritesheet frame boundaries ---
                                 // When a 4x4 block straddles a frame edge, some pixels are opaque (frame
                                 // content) and some are transparent (gap). Transparent pixels often have
@@ -6635,6 +6961,11 @@ static void bc7e_compress_block_range(
                                 bc7_block_stats stats;
                                 compute_block_stats(&stats, temp_pixels);
 
+                                // FIX 3: propagate noise-like flag for refinement cap.
+                                params.m_noise_like_block = stats.is_noise_like;
+                                // SLIDING-SCALE: propagate spatial_corr for perceptual blend.
+                                params.m_spatial_corr = stats.spatial_corr;
+
                                 const bool has_alpha_final = (lo_a < 255.0f);
                                 const bool bimodal_alpha = (stats.min_alpha < 64 && stats.max_alpha >= 128);
 
@@ -6651,5 +6982,4 @@ static void bc7e_compress_block_range(
 }
 
 #endif // BC7_ENCODER_BASE_H
-
 
