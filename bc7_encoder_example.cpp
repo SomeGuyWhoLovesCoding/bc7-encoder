@@ -14,7 +14,7 @@
 //   cl /EHsc /O2 /std:c++17 /I. bc7_encoder_example.cpp /Fe:bc7_encoder_example.exe
 //
 // Usage:
-//   bc7_encoder_example <input.png> <output.dds> [-pmalpha]
+//   bc7_encoder_example <input.png> <output.dds> [-pmalpha] [-flipvertical]
 //
 // Quality is locked to level 2 (default/balanced).
 // Uses all available CPU cores via std::thread with atomic work stealing
@@ -290,14 +290,17 @@ static void generate_mode_visualization(const char* filename, const uint8_t* bc7
 int main(int argc, char* argv[])
 {
     bool premultiplied_alpha = false;
+    bool flip_vertical = false;
     const char* in_path = nullptr;
     const char* out_path = nullptr;
 
-    // Flexible argument parsing to handle optional -pmalpha flag
+    // Flexible argument parsing to handle optional flags
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "-pmalpha") {
             premultiplied_alpha = true;
+        } else if (arg == "-flipvertical") {
+            flip_vertical = true;
         } else if (!in_path) {
             in_path = argv[i];
         } else if (!out_path) {
@@ -306,8 +309,9 @@ int main(int argc, char* argv[])
     }
 
     if (!in_path || !out_path) {
-        fprintf(stderr, "Usage: %s <input.png> <output.dds> [-pmalpha]\n", argv[0]);
-        fprintf(stderr, "  -pmalpha : Preprocess the image with premultiplied alpha before encoding.\n");
+        fprintf(stderr, "Usage: %s <input.png> <output.dds> [-pmalpha] [-flipvertical]\n", argv[0]);
+        fprintf(stderr, "  -pmalpha      : Preprocess the image with premultiplied alpha before encoding.\n");
+    fprintf(stderr, "  -flipvertical : Flip the image vertically before encoding (top<->bottom).\n");
         return 1;
     }
 
@@ -319,6 +323,20 @@ int main(int argc, char* argv[])
     }
 
     fprintf(stderr, "Loaded %dx%d image \"%s\" - %d channels\n", w, h, in_path, ch);
+
+    // Flip vertically if requested (bottom-to-top for DDS / Unity compatibility)
+    if (flip_vertical) {
+        fprintf(stderr, "Flipping image vertically...\n");
+        int row_bytes = w * 4;
+        std::vector<uint8_t> tmp_row(row_bytes);
+        for (int y = 0; y < h / 2; y++) {
+            uint8_t* row_a = pixels + y * row_bytes;
+            uint8_t* row_b = pixels + (h - 1 - y) * row_bytes;
+            memcpy(tmp_row.data(), row_a, row_bytes);
+            memcpy(row_a, row_b, row_bytes);
+            memcpy(row_b, tmp_row.data(), row_bytes);
+        }
+    }
 
     // Apply premultiplied alpha preprocessing if requested
     if (premultiplied_alpha) {
