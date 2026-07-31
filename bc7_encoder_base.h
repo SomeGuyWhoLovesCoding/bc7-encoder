@@ -1522,14 +1522,6 @@ static inline uint64_t compute_color_distance_rgba(const color_quad_i * pE1, con
         
         rgb_err = weights[0] * dr * dr + weights[1] * dg * dg + weights[2] * db * db;
     }
-    // Alpha-weight the RGB error so the encoder doesn't sacrifice visible
-    // pixel color accuracy to match RGB of nearly-transparent pixels.
-    // Uses min(orig, recon) alpha to handle cases where the encoder
-    // incorrectly boosts alpha of a transparent pixel.
-    // Floor at 1/255 prevents the optimizer from seeing zero gradient.
-    float a_w = ((float)min(pE1->m_c[3], pE2->m_c[3]) / 255.0f);
-    if (a_w < (1.0f / 255.0f)) a_w = (1.0f / 255.0f);
-    rgb_err *= a_w;
     // =========================================
 
     return (int64_t)(rgb_err + a_err);
