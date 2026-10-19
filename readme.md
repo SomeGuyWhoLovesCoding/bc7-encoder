@@ -4,17 +4,23 @@ I'm serious, this version actually knows what it's doing and optimizes for any r
 
 It is completely beginner friendly and that's it.
 
-And there's also minimal quality loss too, meaning this is the literal fastest whilst preventing some sort of artitacting that went on compared to DirectXTex too. My use-case stands, and I will always automate bc7 encoding with the highest quality possible whilst retaining the nice efficiency I get!
+And there's also minimal quality loss too, meaning this is the literal fastest whilst preventing any (if not, all) artifacts that went on compared to DirectXTex too.
+
+My use-case stands, and I will always automate bc7 encoding with the highest quality possible whilst retaining the nice efficiency I get for funkin' view! Makes it so modpack preparation's texture compression is insanely speedy. Mostly on PC.
 
 Yep. Mine's virtually identical, and also (possibly) better quality than others, except it's multitudes faster because I just observed the exact speed of each of the encoders on the list and have done vastly big amounts of other plentiful optimizations.
 
 ## How to compile
 
-If you really want to contribute, here's this:
+Linux distros:
 
-Linux distros: `g++ -std=c++17 -O3 -pthread bc7_encoder_example.cpp -o bc7_encoder_example -lm`
+- `g++ -std=c++17 -O3 -pthread bc7_encoder_example.cpp -o bc7_encoder_example -lm`
 
-Windows: `cl.exe /Fe"F:\jerem\NewDownloads\official-bc7-encoder\bc7-encoder\bc7.exe" "F:\jerem\NewDownloads\official-bc7-encoder\bc7-encoder\bc7_encoder_example.cpp" -O2 /std:c++14`
+Windows:
+
+- `cl.exe /Fe"PATH_TO_DOWNLOAD\bc7-encoder\bc7.exe" "PATH_TO_DOWNLOAD\bc7-encoder\bc7_encoder_example.cpp" -O2 /std:c++14`
+
+(PATH_TO_DOWNLOAD=your path to the bc7-encoder repository once downloaded and extracted)
 
 (Make sure you have Visual Studio installed before finding x64 Native Tools Command Prompt — should be in your "Visual Studio YEAR" folder in the startup menu)
 
@@ -38,15 +44,15 @@ It's also a waste of the GPU's resource, but I was thinking for bit "why not jus
 
 2. Richgell's BC7E/F_RDO
 
-You've never heard of this person, because he's had this strange but super-niche hobby of a specific texture compression known as bc7, where he tries to experiment with optimizing it, such as RDO for example (**Rate Distortion Optimization**), and even programming the whole ass encoder in ispc, which added a few MORE layers of compelxity.
+You've never heard of this person, because he's had this strange but super-niche hobby of a specific texture compression known as bc7, where he tries to experiment with optimizing it, such as RDO for example (**Rate Distortion Optimization**), and even programming the encoder in ispc, which added a few MORE layers of compelxity.
 
 *This tool's based on their his bc7e_rdo ispc code though!*
 
-Fuck it, the ISPC version of bc7 compression was discontinued, as intel themselves have ceased all future updates of it, and so you can run it on any dekstop platform now.
+Fuck that actually, the ISPC version of bc7 compression was discontinued, as intel themselves have ceased all future updates of it, and so you can run it on any dekstop platform now.
 
-When going to basis universal (which I actually found about very early on in my bc7 compression rabbithole), I saw it as a bulky ass compressed texture transcoder, which does not fit my purpose at all.
+When going to basis universal (which I actually found about very early on in my bc7 compression rabbithole), I saw it as this bulky ass transcoder, which is completely unfitting for my purpose of this.
 
-It does have bc7f in it, whichh... Eh, not really gonna bother.
+It does have bc7f in it, whichh... Eh, not really gonna bother. It's just not it.
 
 bc7f/rdo (as far as I know) is to build yourself whilst it's average efficiency proper bc7 compression code, just with ISPC instead to apparently "speed" up the process.
 
@@ -54,7 +60,7 @@ bc7f/rdo (as far as I know) is to build yourself whilst it's average efficiency 
 
 The fact BC7 encoding performs this bad on a specific tool like is insane. Compressinator is very bulky, meaning it's not easily just a lightweight cross-platform drop in feature, and even that's stuck as an ACADEMIC version (literally), just like texconv.
 
-It does have GPU options, but I'm also not willing to handle all gpu options, as they're technically useless to me anyway.
+It does have GPU options, but I'm also not willing to handle all gpu options, as they're technically just faces.
 
 Fuck it, i'll even go as far as saying it's built for NVIDIA.
 
@@ -74,7 +80,7 @@ Basically:
 
 1. I just reduced the max partitions for mode 2 from 64 to 8, which was already pretty impactful even doing 16, and then...
 
-2. I just did a bit more small optimizations since I most often test spritesheets of a big ass size.
+2. I just did a bit more small optimizations since I most often test spritesheets of a ginormous size.
 
 And for the last optimization I did, was just rewriting the `evaluate_solution` function to use integer LUT's, which let the compiler autovectorize the rest of that part, which is already impressive.
 
