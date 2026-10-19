@@ -58,7 +58,9 @@ bc7f/rdo (as far as I know) is to build yourself whilst it's average efficiency 
 
 3. AMD's compressinator
 
-The fact BC7 encoding performs this bad on a specific tool like is insane. Compressinator is very bulky, meaning it's not easily just a lightweight cross-platform drop in feature, and even that's stuck as an ACADEMIC version (literally), just like texconv.
+The fact BC7 encoding performs this bad on a specific tool like is insane as it brute force EVERY mode, leading to insane power consumption.
+
+Like basis universal (which I already don't need), compressinator is very bulky, meaning it's not easily just a lightweight cross-platform drop in feature, and even that's stuck as an ACADEMIC version (literally), just like texconv.
 
 It does have GPU options, but I'm also not willing to handle all gpu options, as they're technically just faces.
 
