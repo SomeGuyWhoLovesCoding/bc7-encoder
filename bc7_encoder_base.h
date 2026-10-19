@@ -90,6 +90,18 @@ struct bc7e_compress_block_params
 	uint32_t m_uber_level;
 	uint32_t m_refinement_passes;
 
+	// ---- Task 3: ADAPTIVE Q-LOOP GATE ----
+	// The uber>=2 Q-loop (endpoint re-fit sweep) historically ran for
+	// every block whose current error exceeded the fixed threshold
+	// (num_pixels * 56) >> 4. When m_uber_err_thresh_override is true,
+	// m_uber_err_thresh replaces that constant: raising it keeps the
+	// uber 2 depth ONLY for the worst blocks (most of the quality at a
+	// fraction of the cost), lowering it widens coverage. The D1
+	// escalation deep set pins this to the historical default so
+	// escalation strength is independent of the global knob.
+	bool m_uber_err_thresh_override;
+	uint32_t m_uber_err_thresh;
+
 	uint32_t m_mode4_rotation_mask;
 	uint32_t m_mode4_index_mask;
 	uint32_t m_mode5_rotation_mask;
@@ -4748,7 +4760,9 @@ static uint64_t color_cell_compression(uint32_t mode, const color_cell_compresso
 				return 0;
 		}
 
-		const uint32_t uber_err_thresh = (num_pixels * 56) >> 4;
+		const uint32_t uber_err_thresh = pComp_params->m_uber_err_thresh_override
+											 ? pComp_params->m_uber_err_thresh
+											 : ((num_pixels * 56) >> 4);
 		if ((pComp_params->m_uber_level >= 2) && (pResults->m_best_overall_err > uber_err_thresh))
 		{
 			const int Q = (pComp_params->m_uber_level >= 4) ? (pComp_params->m_uber_level - 2) : 1;
@@ -8506,6 +8520,9 @@ void bc7e_compress_block_params_init(bc7e_compress_block_params *p, bool percept
 	p->m_pbit_search = false;
 	p->m_mode6_only = false;
 	p->m_refinement_passes = 1;
+	// Task 3: Q-loop gate at its historical formula value (16 px * 56 >> 4 = 56).
+	p->m_uber_err_thresh_override = false;
+	p->m_uber_err_thresh = 56;
 	p->m_mode4_rotation_mask = 0xF;
 	p->m_mode4_index_mask = 3;
 	p->m_mode5_rotation_mask = 0xF;
@@ -8929,6 +8946,11 @@ static void bc7e_compress_block_range(
 		deep_params.m_uber_level = 2;
 		deep_params.m_refinement_passes = 3;
 		deep_params.m_pbit_search = true;
+		// Pin the Q-loop gate to the historical formula value so the
+		// deep re-encode keeps full strength even when the caller
+		// raised the global adaptive gate (Task 3).
+		deep_params.m_uber_err_thresh_override = true;
+		deep_params.m_uber_err_thresh = 56;
 		deep_params.m_opaque_settings.m_max_mode13_partitions_to_try = 8;
 		deep_params.m_opaque_settings.m_max_mode0_partitions_to_try = 4;
 		deep_params.m_opaque_settings.m_max_mode2_partitions_to_try = 4;

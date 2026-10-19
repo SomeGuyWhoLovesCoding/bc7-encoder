@@ -134,10 +134,26 @@ static bool write_dds_bc7(const char *filename, int width, int height,
 
 struct BC7EncodeOptions
 {
-	bool use_cache = true;		   // B1: shared block dedup cache
-	bool escalation = true;		   // D1: inline error-gated deep re-encode
-	uint32_t esc_thresh = 0;	   // 0 = encoder default (512; opaque gate 4096)
-	unsigned threads_override = 0; // 0 = hardware_concurrency
+	bool use_cache = true;			// B1: shared block dedup cache
+	bool escalation = true;			// D1: inline error-gated deep re-encode
+	uint32_t esc_thresh = 0;		// 0 = encoder default (512; opaque gate 4096)
+	uint32_t esc_opaque_thresh = 0; // 0 = encoder default (4096)
+	unsigned threads_override = 0;	// 0 = hardware_concurrency
+
+	// ---- per-mode tuning sweep knobs (Task 3) ----
+	// Every default (-1 / 0) preserves the shipped configuration exactly,
+	// so a binary built from this driver with no extra flags is bitwise
+	// identical to the pre-sweep bc7_esc.
+	int uber_override = -1;		   // -1 = shipped default 1 (Q-loop depth 0..4)
+	int uber_thresh_override = -1; // -1 = default formula ((16*56)>>4 = 56); adaptive Q-loop gate
+	int refine_override = -1;	   // -1 = shipped default 1 (endpoint refit passes)
+	int pbit_override = -1;		   // -1 = shipped default 0 (p-bit A/B endpoint search)
+	uint32_t m0_override = 0;	   // 0 = shipped default 1 (mode 0 partition candidates)
+	uint32_t m13_override = 0;	   // 0 = shipped default 2 (mode 1/3 partition candidates)
+	uint32_t m2_override = 0;	   // 0 = shipped default 1 (mode 2 partition candidates)
+	uint32_t m7_override = 0;	   // 0 = shipped default 2 (mode 7 partition candidates)
+	int caps_hard_override = -1;   // -1 = shipped default false (mode13 cap as hard floor)
+	float dcw_override = -1.0f;	   // <0 = shipped default 0.0 (partition DC penalty weight)
 };
 
 struct BC7EncodeStats
@@ -194,6 +210,33 @@ public:
 		params.m_escalation_enabled = opt.escalation;
 		if (opt.esc_thresh)
 			params.m_escalation_err_thresh = opt.esc_thresh;
+		if (opt.esc_opaque_thresh)
+			params.m_escalation_opaque_err_thresh = opt.esc_opaque_thresh;
+
+		// ---- per-mode tuning sweep knobs (all defaults = shipped config) ----
+		if (opt.uber_override >= 0)
+			params.m_uber_level = (uint32_t)opt.uber_override;
+		if (opt.uber_thresh_override >= 0)
+		{
+			params.m_uber_err_thresh_override = true;
+			params.m_uber_err_thresh = (uint32_t)opt.uber_thresh_override;
+		}
+		if (opt.refine_override >= 0)
+			params.m_refinement_passes = (uint32_t)opt.refine_override;
+		if (opt.pbit_override >= 0)
+			params.m_pbit_search = (opt.pbit_override != 0);
+		if (opt.m0_override)
+			params.m_opaque_settings.m_max_mode0_partitions_to_try = opt.m0_override;
+		if (opt.m13_override)
+			params.m_opaque_settings.m_max_mode13_partitions_to_try = opt.m13_override;
+		if (opt.m2_override)
+			params.m_opaque_settings.m_max_mode2_partitions_to_try = opt.m2_override;
+		if (opt.m7_override)
+			params.m_alpha_settings.m_max_mode7_partitions_to_try = opt.m7_override;
+		if (opt.caps_hard_override >= 0)
+			params.m_opaque_settings.m_partition_caps_hard = (opt.caps_hard_override != 0);
+		if (opt.dcw_override >= 0.0f)
+			params.m_partition_dc_penalty_weight = opt.dcw_override;
 
 		// bc7e_compress_block_init() initializes the codec's lookup tables
 		// (defined in bc7_encoder_base.h, independent of any SIMD path).
@@ -387,6 +430,50 @@ int main(int argc, char *argv[])
 		{
 			opt.esc_thresh = (uint32_t)atol(argv[++i]);
 		}
+		else if (arg == "-esc-opaque" && i + 1 < argc)
+		{
+			opt.esc_opaque_thresh = (uint32_t)atol(argv[++i]);
+		}
+		else if (arg == "-uber" && i + 1 < argc)
+		{
+			opt.uber_override = atoi(argv[++i]);
+		}
+		else if (arg == "-uber-thresh" && i + 1 < argc)
+		{
+			opt.uber_thresh_override = atoi(argv[++i]);
+		}
+		else if (arg == "-refine" && i + 1 < argc)
+		{
+			opt.refine_override = atoi(argv[++i]);
+		}
+		else if (arg == "-pbit" && i + 1 < argc)
+		{
+			opt.pbit_override = atoi(argv[++i]);
+		}
+		else if (arg == "-m0" && i + 1 < argc)
+		{
+			opt.m0_override = (uint32_t)atol(argv[++i]);
+		}
+		else if (arg == "-m13" && i + 1 < argc)
+		{
+			opt.m13_override = (uint32_t)atol(argv[++i]);
+		}
+		else if (arg == "-m2" && i + 1 < argc)
+		{
+			opt.m2_override = (uint32_t)atol(argv[++i]);
+		}
+		else if (arg == "-m7" && i + 1 < argc)
+		{
+			opt.m7_override = (uint32_t)atol(argv[++i]);
+		}
+		else if (arg == "-caps-hard" && i + 1 < argc)
+		{
+			opt.caps_hard_override = atoi(argv[++i]);
+		}
+		else if (arg == "-dcw" && i + 1 < argc)
+		{
+			opt.dcw_override = (float)atof(argv[++i]);
+		}
 		else if (arg == "-nometrics")
 		{
 			print_metrics = false;
@@ -413,6 +500,17 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "  -nocache        : Disable the B1 shared block dedup cache.\n");
 		fprintf(stderr, "  -noesc          : Disable D1 inline adaptive escalation.\n");
 		fprintf(stderr, "  -esc-thresh N   : Escalation error gate for alpha blocks (default 512).\n");
+		fprintf(stderr, "  -esc-opaque N   : Escalation error gate for opaque blocks (default 4096).\n");
+		fprintf(stderr, "  -uber N         : Q-loop depth (default 1).\n");
+		fprintf(stderr, "  -uber-thresh N  : Adaptive Q-loop error gate (default 56, needs -uber 2+).\n");
+		fprintf(stderr, "  -refine N       : Endpoint refit passes (default 1).\n");
+		fprintf(stderr, "  -pbit 0|1       : P-bit A/B endpoint search (default 0).\n");
+		fprintf(stderr, "  -m0 N           : Mode 0 partition candidates (default 1).\n");
+		fprintf(stderr, "  -m13 N          : Mode 1/3 partition candidates (default 2).\n");
+		fprintf(stderr, "  -m2 N           : Mode 2 partition candidates (default 1).\n");
+		fprintf(stderr, "  -m7 N           : Mode 7 partition candidates (default 2).\n");
+		fprintf(stderr, "  -caps-hard 0|1  : Mode 1/3 cap acts as hard floor (default 0).\n");
+		fprintf(stderr, "  -dcw F          : Partition DC penalty weight 0..8 (default 0).\n");
 		fprintf(stderr, "  -nometrics      : Skip the PSNR report at the end.\n");
 		fprintf(stderr, "  -threads N      : Override worker thread count (default: all cores).\n");
 		return 1;
