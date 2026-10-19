@@ -14,7 +14,7 @@ Yep. Mine's virtually identical, and also (possibly) better quality than others,
 
 Linux distros:
 
-- `g++ -std=c++17 -O3 -pthread bc7_encoder_example.cpp -o bc7_encoder_example -lm`
+- `g++ -std=c++17 -O3 -DNDEBUG -pthread -I. -o bc7_encoder_example bc7_encoder_example.cpp -lm`
 
 Windows:
 
